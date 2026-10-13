@@ -648,7 +648,7 @@ def get_reward(
         contact_pos = site_xpos_torch[:, config.contact_site_ids]
         contact_dist = torch.norm(contact_pos - contact_pos_ref, p=2, dim=-1)
         contact_dist_masked = contact_dist * contact_ref.unsqueeze(0)
-        contact_rew = -contact_dist_masked.sum(dim=1)
+        contact_rew = -config.contact_rew_scale * contact_dist_masked.sum(dim=1)
     else:
         contact_rew = 0.0
 

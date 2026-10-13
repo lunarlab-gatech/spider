@@ -1,7 +1,9 @@
 """Run IK for the given hand type and mode.
 
 This is a simplified version of IK based on mink.
-No act scene, open-hand, or contact support.
+No act scene or open-hand support. When detect_contact.py wrote per-span
+contact points, the output carries per-frame contact targets for the MJWP
+contact reward (see contact_targets).
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.
@@ -115,6 +117,25 @@ def _build_ref_skeleton(server, mano_assets_root, qpos_ref, ref_idx, embodiment_
             h.positions = np.stack([wrist_pos, qpos_ref[t, tidx, :3]])
 
     return update
+
+
+def contact_targets(
+    contact: np.ndarray, local_points: np.ndarray, object_pose: np.ndarray
+) -> np.ndarray:
+    """World-frame contact targets (N, K, 3) from object-frame span points.
+
+    local_points (N, K, 3) holds each fingertip's span point in the frame of
+    the object it touches, and object_pose (N, 7) that object's pose as
+    [x, y, z, qw, qx, qy, qz]. Targets move with the object; frames without
+    contact get the object origin, which the masked reward ignores.
+    """
+    targets = np.zeros(local_points.shape)
+    rotation = np.zeros(9)
+    for t in range(len(object_pose)):
+        mujoco.mju_quat2Mat(rotation, object_pose[t, 3:])
+        world = local_points[t] @ rotation.reshape(3, 3).T + object_pose[t, :3]
+        targets[t] = np.where(contact[t][:, None] > 0, world, object_pose[t, :3])
+    return targets
 
 
 def main(
@@ -433,12 +454,52 @@ def main(
             signal_data, np.ones(window_size) / window_size, mode="valid"
         )
 
-    filtered = np.zeros(
-        (qpos_list.shape[0] - average_frame_size + 1, qpos_list.shape[1])
-    )
-    for i in range(qpos_list.shape[1]):
-        filtered[:, i] = moving_average_filter(qpos_list[:, i], average_frame_size)
-    qpos_list = filtered
+    def filter_columns(values):
+        flat = values.reshape(len(values), -1)
+        out = np.zeros((len(flat) - average_frame_size + 1, flat.shape[1]))
+        for i in range(flat.shape[1]):
+            out[:, i] = moving_average_filter(flat[:, i], average_frame_size)
+        return out.reshape(len(out), *values.shape[1:])
+
+    qpos_list = filter_columns(qpos_list)
+
+    # -- Contact targets, one column per tracked fingertip site --
+    contact_out = {}
+    sides = [s.split("_")[0] for s in finger_sites]
+    if all(f"contact_pos_frame_{s}" in loaded_data for s in set(sides)):
+        columns, local_columns, object_poses = [], [], []
+        for site_name, side in zip(finger_sites, sides, strict=True):
+            slot = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"].index(
+                site_name[len(side) + 1 :]
+            )
+            obj = str(loaded_data[f"contact_object_{side}"])
+            columns.append(loaded_data[f"contact_{side}"][start_idx:end_idx, slot])
+            local_columns.append(
+                loaded_data[f"contact_pos_frame_{side}"][start_idx:end_idx, slot]
+            )
+            object_poses.append(qpos_ref[:, ref_idx[obj]])
+        contact = np.stack(columns, axis=1)
+        targets = np.stack(
+            [
+                contact_targets(contact[:, [k]], local_columns[k][:, None], pose)[:, 0]
+                for k, pose in enumerate(object_poses)
+            ],
+            axis=1,
+        )
+        contact_out = {
+            "contact": filter_columns(contact)[1:],
+            "contact_pos": filter_columns(targets)[1:],
+        }
+        site_ids = [
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, s) for s in finger_sites
+        ]
+        robot_task_info = Path(processed_dir_robot).parent / "task_info.json"
+        info = json.loads(robot_task_info.read_text()) if robot_task_info.exists() else {}
+        info["contact_site_ids"] = site_ids
+        robot_task_info.write_text(json.dumps(info, indent=2))
+        loguru.logger.info(
+            f"Contact targets for {finger_sites}; site ids {site_ids} in {robot_task_info}"
+        )
 
     # -- Compute qvel via finite differences --
     n_filtered = qpos_list.shape[0]
@@ -482,7 +543,9 @@ def main(
         loguru.logger.info(f"Saved video to {video_path}")
 
     out_npz = f"{file_dir}/trajectory_kinematic.npz"
-    np.savez(out_npz, qpos=qpos_list, qvel=qvel_list, frequency=1 / ref_dt)
+    np.savez(
+        out_npz, qpos=qpos_list, qvel=qvel_list, frequency=1 / ref_dt, **contact_out
+    )
     loguru.logger.info(f"Saved {out_npz}")
 
     out_npz = f"{file_dir}/trajectory_ikrollout.npz"

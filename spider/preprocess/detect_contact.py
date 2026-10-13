@@ -25,6 +25,40 @@ from loop_rate_limiters import RateLimiter
 import spider
 from spider.io import get_processed_data_dir
 
+# A contact span whose object-frame fingertip positions spread more than this
+# along any axis (standard deviation, meters) is a sliding contact and is dropped.
+MAX_CONTACT_SPREAD_M = 0.1
+
+
+def span_contact_points(
+    contact: np.ndarray, local_pos: np.ndarray, max_spread: float = MAX_CONTACT_SPREAD_M
+) -> tuple[np.ndarray, np.ndarray]:
+    """One contact point per contact span instead of one per clip.
+
+    contact (N, K) marks frames where fingertip k touches the object, and
+    local_pos (N, K, 3) holds the fingertip in the object frame. A span is a
+    run of contact frames for one fingertip; its point is the mean local
+    position over the span, so a hand that lets go and grips elsewhere gets a
+    new point. Spans that spread more than max_spread are dropped. Returns
+    the kept contact (N, K) and the per-frame span point (N, K, 3), zero
+    outside kept spans.
+    """
+    kept = np.zeros(contact.shape, dtype=bool)
+    points = np.zeros(local_pos.shape)
+    for k in range(contact.shape[1]):
+        edges = np.flatnonzero(np.diff(np.r_[0, contact[:, k].astype(int), 0]))
+        for start, end in zip(edges[::2], edges[1::2]):
+            span = local_pos[start:end, k]
+            if span.std(axis=0).max() > max_spread:
+                loguru.logger.warning(
+                    f"contact slot {k} frames {start}-{end - 1} spread over "
+                    f"{span.std(axis=0).max():.3f} m, dropping the span"
+                )
+                continue
+            kept[start:end, k] = True
+            points[start:end, k] = span.mean(axis=0)
+    return kept, points
+
 
 def main(
     dataset_dir: str = f"{spider.ROOT}/../example_datasets",
@@ -379,44 +413,38 @@ def main(
                         contact_seq[np.maximum(0, i - 1) : np.minimum(N, i + 1), :],
                         axis=0,
                     )
-                # get contact position
+                contact_seq_smooth, contact_pos_frame = span_contact_points(
+                    contact_seq_smooth.astype(bool), contact_pos
+                )
+                # One point per slot over all kept frames, for the fixed
+                # track_object_* sites that generate_xml.py places.
                 avg_contact_pos = np.zeros((Ncontact, 3))
-                std_contact_pos = np.zeros((Ncontact, 3))
                 for i in range(Ncontact):
-                    cnt = 0
-                    contact_pos_list = []
-                    for j in range(N):
-                        if contact_seq[j, i]:
-                            avg_contact_pos[i, :] += contact_pos[j, i, :]
-                            contact_pos_list.append(contact_pos[j, i, :])
-                            cnt += 1
-                    if cnt > 0:
-                        avg_contact_pos[i, :] /= cnt
-                        contact_pos_list = np.array(contact_pos_list)
-                        std_contact_pos[i, :] = np.std(contact_pos_list, axis=0)
-                for i in range(Ncontact):
-                    if std_contact_pos[i, :].max() > 0.1:
-                        loguru.logger.warning(
-                            "contact point moving in a large range, disable contact point"
-                        )
-                        contact_seq_smooth[:, i] = False
-                        avg_contact_pos[i, :] = np.zeros(3)
+                    if contact_seq_smooth[:, i].any():
+                        avg_contact_pos[i] = contact_pos_frame[contact_seq_smooth[:, i], i].mean(axis=0)
+                contact_seq_smooth = contact_seq_smooth.astype(float)
 
                 if embodiment_type == "bimanual":
                     contact_right = contact_seq_smooth[:, :5]
                     contact_left = contact_seq_smooth[:, 5:]
                     contact_pos_right = avg_contact_pos[:5, :]
                     contact_pos_left = avg_contact_pos[5:, :]
+                    contact_pos_frame_right = contact_pos_frame[:, :5]
+                    contact_pos_frame_left = contact_pos_frame[:, 5:]
                 elif embodiment_type == "right":
-                    contact_right = contact_seq_smooth
-                    contact_pos_right = avg_contact_pos
+                    contact_right = contact_seq_smooth[:, :5]
+                    contact_pos_right = avg_contact_pos[:5]
+                    contact_pos_frame_right = contact_pos_frame[:, :5]
                     contact_left = np.zeros_like(contact_right)
                     contact_pos_left = np.zeros_like(contact_pos_right)
+                    contact_pos_frame_left = np.zeros_like(contact_pos_frame_right)
                 elif embodiment_type == "left":
-                    contact_left = contact_seq_smooth
-                    contact_pos_left = avg_contact_pos
+                    contact_left = contact_seq_smooth[:, 5:]
+                    contact_pos_left = avg_contact_pos[5:]
+                    contact_pos_frame_left = contact_pos_frame[:, 5:]
                     contact_right = np.zeros_like(contact_left)
                     contact_pos_right = np.zeros_like(contact_pos_left)
+                    contact_pos_frame_right = np.zeros_like(contact_pos_frame_left)
                 else:
                     raise ValueError(f"Invalid hand type: {embodiment_type}")
                 # save contact_seq_smooth to npz
@@ -434,6 +462,12 @@ def main(
                     contact_pos_left=contact_pos_left,
                     contact_right=contact_right,
                     contact_pos_right=contact_pos_right,
+                    # Per-frame span points in the frame of the object each
+                    # side touches (contact_object_<side>), zero off contact.
+                    contact_pos_frame_left=contact_pos_frame_left,
+                    contact_pos_frame_right=contact_pos_frame_right,
+                    contact_object_left=object_list[1],
+                    contact_object_right=object_list[0],
                 )
                 loguru.logger.info(f"Saved contact data to {contact_out_path}")
                 if plot_contact:
