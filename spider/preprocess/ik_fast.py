@@ -3,7 +3,11 @@
 This is a simplified version of IK based on mink.
 No act scene or open-hand support. When detect_contact.py wrote per-span
 contact points, the output carries per-frame contact targets for the MJWP
-contact reward (see contact_targets).
+contact reward (see contact_targets). With object_clearance set, the hand
+collision geoms keep that distance from the object and fixture collision geoms:
+a hard limit stops the hand moving in, and PenetrationTask pushes out geoms the
+moving object stepped into, so the reference does not ask MJWP to hold fingers
+inside an object.
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.
@@ -119,6 +123,50 @@ def _build_ref_skeleton(server, mano_assets_root, qpos_ref, ref_idx, embodiment_
     return update
 
 
+# Cost of 1 m of hand-object penetration, against finger_pos_cost (10 by default)
+# per meter of fingertip error: a finger 1 mm inside an object costs as much as
+# 1 cm of fingertip error.
+PENETRATION_COST = 100.0
+
+
+class PenetrationTask(mink.Task):
+    """Soft push-out for hand geoms that end up inside an object.
+
+    The object follows its reference and can step into the hand between frames,
+    which mink's CollisionAvoidanceLimit cannot undo: it only bounds approach.
+    For each pair closer than `clearance`, the task error is dist - clearance and
+    its Jacobian the rate of change of dist, so the solver trades the push-out
+    against the fingertip targets instead of failing.
+    """
+
+    def __init__(self, limit, clearance, cost=PENETRATION_COST):
+        super().__init__(cost=np.full(len(limit.geom_id_pairs), cost), gain=1.0, lm_damping=1e-3)
+        self.limit, self.clearance = limit, clearance
+
+    def _rows(self, configuration):
+        from mink.limits.collision_avoidance_limit import compute_contact_normal_jacobian
+
+        lim, model, data = self.limit, configuration.model, configuration.data
+        error = np.zeros(len(lim.geom_id_pairs))
+        jac = np.zeros((len(lim.geom_id_pairs), model.nv))
+        for i, (g1, g2) in enumerate(lim.geom_id_pairs):
+            dist = mujoco.mj_geomDistance(model, data, g1, g2, self.clearance + 0.01, lim._fromto)
+            if dist >= self.clearance:
+                continue
+            row = compute_contact_normal_jacobian(
+                model, data, g1, g2, lim._fromto, lim._normal, lim._jac1, lim._jac2
+            )
+            error[i] = dist - self.clearance
+            jac[i] = row if dist >= 0 else -row
+        return error, jac
+
+    def compute_error(self, configuration):
+        return self._rows(configuration)[0]
+
+    def compute_jacobian(self, configuration):
+        return self._rows(configuration)[1]
+
+
 def contact_targets(
     contact: np.ndarray, local_points: np.ndarray, object_pose: np.ndarray
 ) -> np.ndarray:
@@ -162,6 +210,7 @@ def main(
     finger_init_steps: int = 300,
     average_frame_size: int = 3,
     z_offset: float = 0.0,
+    object_clearance: float | None = None,
 ):
     # Resolve directories
     dataset_dir = os.path.abspath(dataset_dir)
@@ -297,9 +346,63 @@ def main(
     else:
         nq_obj = 0
 
-    # Create mink configuration
-    configuration = mink.Configuration(model)
+    # Create mink configuration. The IK model is a separate copy because the
+    # collision limit needs contype/conaffinity set, which the rollout model must
+    # not have: SPIDER scenes enable contact only through explicit pairs.
+    ik_model = mujoco.MjModel.from_xml_path(model_path)
+    configuration = mink.Configuration(ik_model)
     data = configuration.data
+    limits = [mink.ConfigurationLimit(ik_model)]
+    constraints = None
+    if object_clearance is not None:
+
+        def geom_names(prefix):
+            return [
+                g
+                for g in range(ik_model.ngeom)
+                if (mujoco.mj_id2name(ik_model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith(prefix)
+            ]
+
+        hand_geoms = geom_names("collision_hand_")
+        object_geoms = [
+            g
+            for g in geom_names("right_object_") + geom_names("left_object_") + geom_names("fixture_")
+            if ik_model.geom_group[g] == 3 or "collision" in ik_model.geom(g).name
+        ]
+        ik_model.geom_contype[hand_geoms + object_geoms] = 1
+        ik_model.geom_conaffinity[hand_geoms + object_geoms] = 1
+        limits.append(
+            mink.CollisionAvoidanceLimit(
+                ik_model,
+                [(hand_geoms, object_geoms)],
+                minimum_distance_from_collisions=object_clearance,
+                collision_detection_distance=object_clearance + 0.02,
+            )
+        )
+        # Objects are set from the reference every substep; without this the
+        # solver would move an object instead of the hand to clear a collision.
+        object_dofs = [
+            ik_model.jnt_dofadr[j] + k
+            for j in range(ik_model.njnt)
+            if ik_model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE
+            for k in range(6)
+        ]
+        if object_dofs:
+            constraints = [mink.DofFreezingTask(ik_model, object_dofs)]
+        loguru.logger.info(
+            f"IK keeps {len(hand_geoms)} hand geoms {object_clearance} m from "
+            f"{len(object_geoms)} object and fixture geoms"
+        )
+
+    extra_tasks = []
+    if object_clearance is not None:
+        extra_tasks = [PenetrationTask(limits[-1], object_clearance)]
+
+    def solve(tasks):
+        return mink.solve_ik(
+            configuration, [*tasks, *extra_tasks], sim_dt, solver, damping=1e-5,
+            limits=limits, constraints=constraints,
+        )
 
     # Build site name lists
     finger_names = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
@@ -339,7 +442,7 @@ def main(
         for s in finger_sites
     ]
 
-    posture_task = mink.PostureTask(model, cost=posture_cost)
+    posture_task = mink.PostureTask(ik_model, cost=posture_cost)
     posture_task.set_target(configuration.q.copy())
 
     tasks_wrist = [posture_task, *wrist_tasks]
@@ -377,7 +480,7 @@ def main(
     configuration.update()
     set_wrist_targets(0)
     for _ in range(wrist_init_steps):
-        vel = mink.solve_ik(configuration, tasks_wrist, sim_dt, solver, damping=1e-5)
+        vel = solve(tasks_wrist)
         configuration.integrate_inplace(vel, sim_dt)
         set_object_qpos(0)
 
@@ -386,7 +489,7 @@ def main(
     configuration.update()
     set_finger_targets(0)
     for _ in range(finger_init_steps):
-        vel = mink.solve_ik(configuration, tasks_all, sim_dt, solver, damping=1e-5)
+        vel = solve(tasks_all)
         configuration.integrate_inplace(vel, sim_dt)
         set_object_qpos(0)
 
@@ -413,9 +516,7 @@ def main(
             configuration.update()
 
             for _ in range(n_substeps):
-                vel = mink.solve_ik(
-                    configuration, tasks_all, sim_dt, solver, damping=1e-5
-                )
+                vel = solve(tasks_all)
                 configuration.integrate_inplace(vel, sim_dt)
                 set_object_qpos(t)
 
