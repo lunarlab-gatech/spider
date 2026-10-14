@@ -820,6 +820,20 @@ def main(
     #             rgba=[0, 1, 0, 1],
     #         )
 
+    # A measured object mass in task_info.json (<side>_object_mass_kg) replaces
+    # volume x object_density: scale the collision geom densities to match it.
+    for side, names in (("right", right_object_collision_names), ("left", left_object_collision_names)):
+        mass_kg = task_info.get(f"{side}_object_mass_kg")
+        if mass_kg is None or not names:
+            continue
+        volume_mass = mj_spec.compile().body(f"{side}_object").mass[0]
+        for name in names:
+            mj_spec.geom(name).density *= float(mass_kg) / volume_mass
+        loguru.logger.info(
+            f"{side} object mass {float(mass_kg):.4f} kg (collision volume at "
+            f"object_density gives {volume_mass:.4f} kg)"
+        )
+
     mj_model = mj_spec.compile()
     mj_data = mujoco.MjData(mj_model)
 
