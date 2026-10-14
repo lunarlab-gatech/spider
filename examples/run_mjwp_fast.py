@@ -191,10 +191,20 @@ class _StepState:
     DONE = "DONE"
 
 
+# Checkpoints kept for REVERT. Each holds a GPU snapshot of every sample world:
+# 74 MiB at 1024 samples on a 48-dof bimanual Inspire scene, so an unbounded
+# history ran a 12 GiB GPU out of memory after 2400 steps of a 2848-step clip.
+# A revert pops one checkpoint and later re-reverts reuse that anchor, and every
+# success pushes one, so only the newest is ever read; 8 leaves headroom.
+_MAX_CHECKPOINTS = 8
+
+
 @dataclass
 class _LoopCtx:
     state: str = _StepState.OPTIMIZE
-    history: collections.deque = field(default_factory=collections.deque)
+    history: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=_MAX_CHECKPOINTS)
+    )
     local_retries: int = 0
     boost_level: int = 0
     revert_anchor_step: int | None = None

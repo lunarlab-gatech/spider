@@ -25,6 +25,40 @@ from loop_rate_limiters import RateLimiter
 import spider
 from spider.io import get_processed_data_dir
 
+# A contact span whose object-frame fingertip positions spread more than this
+# along any axis (standard deviation, meters) is a sliding contact and is dropped.
+MAX_CONTACT_SPREAD_M = 0.1
+
+
+def span_contact_points(
+    contact: np.ndarray, local_pos: np.ndarray, max_spread: float = MAX_CONTACT_SPREAD_M
+) -> tuple[np.ndarray, np.ndarray]:
+    """One contact point per contact span instead of one per clip.
+
+    contact (N, K) marks frames where fingertip k touches the object, and
+    local_pos (N, K, 3) holds a per-frame point in the object frame (the
+    object-surface point nearest the fingertip). A span is a run of contact
+    frames for one fingertip; its point is the mean local position over the
+    span, so a hand that lets go and grips elsewhere gets a new point. Spans that spread more than max_spread are dropped. Returns
+    the kept contact (N, K) and the per-frame span point (N, K, 3), zero
+    outside kept spans.
+    """
+    kept = np.zeros(contact.shape, dtype=bool)
+    points = np.zeros(local_pos.shape)
+    for k in range(contact.shape[1]):
+        edges = np.flatnonzero(np.diff(np.r_[0, contact[:, k].astype(int), 0]))
+        for start, end in zip(edges[::2], edges[1::2]):
+            span = local_pos[start:end, k]
+            if span.std(axis=0).max() > max_spread:
+                loguru.logger.warning(
+                    f"contact slot {k} frames {start}-{end - 1} spread over "
+                    f"{span.std(axis=0).max():.3f} m, dropping the span"
+                )
+                continue
+            kept[start:end, k] = True
+            points[start:end, k] = span.mean(axis=0)
+    return kept, points
+
 
 def main(
     dataset_dir: str = f"{spider.ROOT}/../example_datasets",
@@ -323,6 +357,32 @@ def main(
 
     mj_model = mj_spec.compile()
     mj_data = mujoco.MjData(mj_model)
+    # Per contact slot (right thumb..pinky, then left): the fingertip geom, the
+    # object body it is measured against, and that object's collision geoms.
+    slot_objects = [object_list[0]] * 5 + [object_list[1]] * 5
+    object_geoms = {
+        "right_object": [mj_model.geom(n).id for n in right_object_collision_names],
+        "left_object": [mj_model.geom(n).id for n in left_object_collision_names],
+    }
+    slot_tip_geoms = [
+        mj_model.geom(n).id for n in right_hand_collision_names + left_hand_collision_names
+    ]
+    fromto = np.zeros(6)
+
+    def surface_points():
+        """Nearest point on each slot's object surface to its fingertip, object frame (10, 3)."""
+        points = np.zeros((len(slot_tip_geoms), 3))
+        for i, (tip, obj) in enumerate(zip(slot_tip_geoms, slot_objects, strict=True)):
+            body = mj_model.body(obj).id
+            best = np.inf
+            for g in object_geoms[obj]:
+                dist = mujoco.mj_geomDistance(mj_model, mj_data, tip, g, 1.0, fromto)
+                if dist < best:
+                    best, world = dist, fromto[3:].copy()
+            if np.isfinite(best):
+                rotation = mj_data.xmat[body].reshape(3, 3)
+                points[i] = rotation.T @ (world - mj_data.xpos[body])
+        return points
     rate_limiter = RateLimiter(1.0 / ref_dt)
 
     if save_video:
@@ -355,6 +415,7 @@ def main(
         Ncontact = 10  # if embodiment_type == "bimanual" else 5
         contact_seq = np.zeros((N, Ncontact))
         contact_pos = np.zeros((N, Ncontact, 3))
+        contact_surface = np.zeros((N, Ncontact, 3))
         while gui.is_running():
             mj_data.qpos[:] = qpos_list[cnt].flatten()
             mj_data.qvel[:] = 0
@@ -370,6 +431,10 @@ def main(
             )  # bimanual: (10, 3) right: (5, 3) left: (5, 3)
             contact_seq[cnt, :] = contact
             contact_pos[cnt, :, :] = fingertip_local_pos
+            # Surface points at the reference pose, not the stepped one.
+            mj_data.qpos[:] = qpos_list[cnt].flatten()
+            mujoco.mj_kinematics(mj_model, mj_data)
+            contact_surface[cnt] = surface_points()
             cnt = (cnt + 1) % N
             if cnt == (N - 1):
                 # post process contact_seq by sliding window
@@ -379,44 +444,38 @@ def main(
                         contact_seq[np.maximum(0, i - 1) : np.minimum(N, i + 1), :],
                         axis=0,
                     )
-                # get contact position
+                contact_seq_smooth, contact_point = span_contact_points(
+                    contact_seq_smooth.astype(bool), contact_surface
+                )
+                # One fingertip point per slot over all kept frames, for the
+                # fixed track_object_* sites that generate_xml.py places.
                 avg_contact_pos = np.zeros((Ncontact, 3))
-                std_contact_pos = np.zeros((Ncontact, 3))
                 for i in range(Ncontact):
-                    cnt = 0
-                    contact_pos_list = []
-                    for j in range(N):
-                        if contact_seq[j, i]:
-                            avg_contact_pos[i, :] += contact_pos[j, i, :]
-                            contact_pos_list.append(contact_pos[j, i, :])
-                            cnt += 1
-                    if cnt > 0:
-                        avg_contact_pos[i, :] /= cnt
-                        contact_pos_list = np.array(contact_pos_list)
-                        std_contact_pos[i, :] = np.std(contact_pos_list, axis=0)
-                for i in range(Ncontact):
-                    if std_contact_pos[i, :].max() > 0.1:
-                        loguru.logger.warning(
-                            "contact point moving in a large range, disable contact point"
-                        )
-                        contact_seq_smooth[:, i] = False
-                        avg_contact_pos[i, :] = np.zeros(3)
+                    if contact_seq_smooth[:, i].any():
+                        avg_contact_pos[i] = contact_pos[contact_seq_smooth[:, i], i].mean(axis=0)
+                contact_seq_smooth = contact_seq_smooth.astype(float)
 
                 if embodiment_type == "bimanual":
                     contact_right = contact_seq_smooth[:, :5]
                     contact_left = contact_seq_smooth[:, 5:]
                     contact_pos_right = avg_contact_pos[:5, :]
                     contact_pos_left = avg_contact_pos[5:, :]
+                    contact_point_right = contact_point[:, :5]
+                    contact_point_left = contact_point[:, 5:]
                 elif embodiment_type == "right":
-                    contact_right = contact_seq_smooth
-                    contact_pos_right = avg_contact_pos
+                    contact_right = contact_seq_smooth[:, :5]
+                    contact_pos_right = avg_contact_pos[:5]
+                    contact_point_right = contact_point[:, :5]
                     contact_left = np.zeros_like(contact_right)
                     contact_pos_left = np.zeros_like(contact_pos_right)
+                    contact_point_left = np.zeros_like(contact_point_right)
                 elif embodiment_type == "left":
-                    contact_left = contact_seq_smooth
-                    contact_pos_left = avg_contact_pos
+                    contact_left = contact_seq_smooth[:, 5:]
+                    contact_pos_left = avg_contact_pos[5:]
+                    contact_point_left = contact_point[:, 5:]
                     contact_right = np.zeros_like(contact_left)
                     contact_pos_right = np.zeros_like(contact_pos_left)
+                    contact_point_right = np.zeros_like(contact_point_left)
                 else:
                     raise ValueError(f"Invalid hand type: {embodiment_type}")
                 # save contact_seq_smooth to npz
@@ -434,6 +493,14 @@ def main(
                     contact_pos_left=contact_pos_left,
                     contact_right=contact_right,
                     contact_pos_right=contact_pos_right,
+                    # Per frame, the object-surface point of the contact span:
+                    # the mean over the span of the surface point nearest the
+                    # fingertip, in the frame of contact_object_<side>; zero
+                    # off contact. It does not depend on the hand that touched.
+                    contact_point_left=contact_point_left,
+                    contact_point_right=contact_point_right,
+                    contact_object_left=object_list[1],
+                    contact_object_right=object_list[0],
                 )
                 loguru.logger.info(f"Saved contact data to {contact_out_path}")
                 if plot_contact:
