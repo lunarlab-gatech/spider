@@ -615,40 +615,6 @@ def _run_sanity_check_body(
     raise RuntimeError("\n".join(msg_parts))
 
 
-def geom_surface_distance(
-    env: MJWPEnv, geom_ids: list[int], points: torch.Tensor
-) -> torch.Tensor:
-    """Unsigned distance (W, K) from each world's geom surfaces to points (K, 3).
-
-    Supports the capsule and sphere geoms that SPIDER hands use for fingertips:
-    the distance from the point to the capsule segment (zero length for a
-    sphere), minus the radius.
-    """
-    model = env.model_cpu
-    types = model.geom_type[geom_ids]
-    supported = (mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_SPHERE)
-    if not np.isin(types, supported).all():
-        raise ValueError(
-            f"contact reward supports capsule and sphere fingertip geoms; "
-            f"geoms {geom_ids} have types {types.tolist()}"
-        )
-    device = points.device
-    radius = torch.as_tensor(model.geom_size[geom_ids, 0], device=device, dtype=points.dtype)
-    half = torch.as_tensor(
-        np.where(types == mujoco.mjtGeom.mjGEOM_CAPSULE, model.geom_size[geom_ids, 1], 0.0),
-        device=device,
-        dtype=points.dtype,
-    )
-    center = wp.to_torch(env.data_wp.geom_xpos)[:, geom_ids]  # (W, K, 3)
-    axis = wp.to_torch(env.data_wp.geom_xmat).view(center.shape[0], -1, 3, 3)[
-        :, geom_ids, :, 2
-    ]  # geom z axis (W, K, 3)
-    offset = points.unsqueeze(0) - center
-    along = (offset * axis).sum(-1).clamp(-half, half)
-    nearest = center + along.unsqueeze(-1) * axis
-    return (torch.norm(points.unsqueeze(0) - nearest, dim=-1) - radius).abs()
-
-
 def get_reward(
     config: Config,
     env: MJWPEnv,
@@ -677,11 +643,7 @@ def get_reward(
     qvel_rew = -config.vel_rew_scale * qvel_dist * 1.0
 
     # contact reward
-    if config.contact_rew_scale > 0.0 and len(config.contact_geom_ids) > 0:
-        contact_dist = geom_surface_distance(env, config.contact_geom_ids, contact_pos_ref)
-        contact_dist_masked = contact_dist * contact_ref.unsqueeze(0)
-        contact_rew = -config.contact_rew_scale * contact_dist_masked.sum(dim=1)
-    elif config.contact_rew_scale > 0.0 and len(config.contact_site_ids) > 0:
+    if config.contact_rew_scale > 0.0 and len(config.contact_site_ids) > 0:
         site_xpos_torch = wp.to_torch(env.data_wp.site_xpos)
         contact_pos = site_xpos_torch[:, config.contact_site_ids]
         contact_dist = torch.norm(contact_pos - contact_pos_ref, p=2, dim=-1)

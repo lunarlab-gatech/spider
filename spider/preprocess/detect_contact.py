@@ -12,6 +12,7 @@ Date: 2025-07-07
 
 import json
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
 
 import loguru
@@ -30,21 +31,44 @@ from spider.io import get_processed_data_dir
 MAX_CONTACT_SPREAD_M = 0.1
 
 
-def span_contact_points(
-    contact: np.ndarray, local_pos: np.ndarray, max_spread: float = MAX_CONTACT_SPREAD_M
-) -> tuple[np.ndarray, np.ndarray]:
-    """One contact point per contact span instead of one per clip.
+def outward_normal(fromto: np.ndarray, dist: float) -> np.ndarray:
+    """Unit object-surface normal from mj_geomDistance(tip, object) output.
 
-    contact (N, K) marks frames where fingertip k touches the object, and
-    local_pos (N, K, 3) holds a per-frame point in the object frame (the
-    object-surface point nearest the fingertip). A span is a run of contact
-    frames for one fingertip; its point is the mean local position over the
-    span, so a hand that lets go and grips elsewhere gets a new point. Spans that spread more than max_spread are dropped. Returns
-    the kept contact (N, K) and the per-frame span point (N, K, 3), zero
+    fromto[:3] lies on the fingertip and fromto[3:] on the object. While the
+    two are apart, fromto[:3] - fromto[3:] points out of the object; while the
+    fingertip penetrates (dist < 0), the same difference points into it, so the
+    sign of dist flips it. Returns zeros when the two points coincide.
+    """
+    offset = np.sign(dist) * (fromto[:3] - fromto[3:])
+    length = np.linalg.norm(offset)
+    return offset / length if length > 0 else np.zeros(3)
+
+
+def span_contact_points(
+    contact: np.ndarray,
+    local_pos: np.ndarray,
+    local_normal: np.ndarray,
+    surface: Callable[[int, np.ndarray, np.ndarray], np.ndarray | None],
+    max_spread: float = MAX_CONTACT_SPREAD_M,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One contact point and normal per contact span instead of one per clip.
+
+    contact (N, K) marks frames where fingertip k touches the object, local_pos
+    (N, K, 3) holds a per-frame point in the object frame (the object-surface
+    point nearest the fingertip), and local_normal (N, K, 3) the outward unit
+    normal at that point, also in the object frame. A span is a run of contact
+    frames for one fingertip, so a hand that lets go and grips elsewhere gets a
+    new point. The span normal is the normalized mean normal. The mean point
+    of a span on a curved surface lies off the surface, so the span point is
+    surface(k, mean point, normal): the point of the object surface that faces
+    the normal on the line through the mean point along it. Spans that spread
+    more than max_spread, or whose line misses the object, are dropped. Returns the
+    kept contact (N, K) and the per-frame span point and normal (N, K, 3), zero
     outside kept spans.
     """
     kept = np.zeros(contact.shape, dtype=bool)
     points = np.zeros(local_pos.shape)
+    normals = np.zeros(local_normal.shape)
     for k in range(contact.shape[1]):
         edges = np.flatnonzero(np.diff(np.r_[0, contact[:, k].astype(int), 0]))
         for start, end in zip(edges[::2], edges[1::2]):
@@ -55,9 +79,20 @@ def span_contact_points(
                     f"{span.std(axis=0).max():.3f} m, dropping the span"
                 )
                 continue
+            normal = local_normal[start:end, k].mean(axis=0)
+            length = np.linalg.norm(normal)
+            normal = normal / length if length > 0 else normal
+            point = surface(k, span.mean(axis=0), normal) if length > 0 else None
+            if point is None:
+                loguru.logger.warning(
+                    f"contact slot {k} frames {start}-{end - 1}: no object surface "
+                    f"along the span normal, dropping the span"
+                )
+                continue
             kept[start:end, k] = True
-            points[start:end, k] = span.mean(axis=0)
-    return kept, points
+            points[start:end, k] = point
+            normals[start:end, k] = normal
+    return kept, points, normals
 
 
 def main(
@@ -370,8 +405,12 @@ def main(
     fromto = np.zeros(6)
 
     def surface_points():
-        """Nearest point on each slot's object surface to its fingertip, object frame (10, 3)."""
+        """Object-surface point nearest each slot's fingertip and outward normal.
+
+        Both are in the object frame, each (10, 3).
+        """
         points = np.zeros((len(slot_tip_geoms), 3))
+        normals = np.zeros((len(slot_tip_geoms), 3))
         for i, (tip, obj) in enumerate(zip(slot_tip_geoms, slot_objects, strict=True)):
             body = mj_model.body(obj).id
             best = np.inf
@@ -379,10 +418,29 @@ def main(
                 dist = mujoco.mj_geomDistance(mj_model, mj_data, tip, g, 1.0, fromto)
                 if dist < best:
                     best, world = dist, fromto[3:].copy()
+                    normal = outward_normal(fromto, dist)
             if np.isfinite(best):
                 rotation = mj_data.xmat[body].reshape(3, 3)
                 points[i] = rotation.T @ (world - mj_data.xpos[body])
-        return points
+                normals[i] = rotation.T @ normal
+        return points, normals
+
+    def surface_along_normal(slot, point, normal):
+        """Object surface point facing normal on the line point + t * normal.
+
+        Each convex object geom has at most one face that faces normal and
+        crosses the line; a ray along -normal from beyond the geom finds it.
+        Returns the one nearest to point, in the object frame, or None when the
+        line misses the object. The objects must sit at the origin.
+        """
+        best = None
+        for g in object_geoms[slot_objects[slot]]:
+            reach = np.linalg.norm(mj_data.geom_xpos[g] - point) + mj_model.geom_rbound[g]
+            hit = mujoco.mj_rayMesh(mj_model, mj_data, g, point + reach * normal, -normal)
+            if hit >= 0 and (best is None or abs(reach - hit) < abs(best)):
+                best = reach - hit
+        return None if best is None else point + best * normal
+
     rate_limiter = RateLimiter(1.0 / ref_dt)
 
     if save_video:
@@ -416,6 +474,7 @@ def main(
         contact_seq = np.zeros((N, Ncontact))
         contact_pos = np.zeros((N, Ncontact, 3))
         contact_surface = np.zeros((N, Ncontact, 3))
+        contact_surface_normal = np.zeros((N, Ncontact, 3))
         while gui.is_running():
             mj_data.qpos[:] = qpos_list[cnt].flatten()
             mj_data.qvel[:] = 0
@@ -434,7 +493,7 @@ def main(
             # Surface points at the reference pose, not the stepped one.
             mj_data.qpos[:] = qpos_list[cnt].flatten()
             mujoco.mj_kinematics(mj_model, mj_data)
-            contact_surface[cnt] = surface_points()
+            contact_surface[cnt], contact_surface_normal[cnt] = surface_points()
             cnt = (cnt + 1) % N
             if cnt == (N - 1):
                 # post process contact_seq by sliding window
@@ -444,8 +503,16 @@ def main(
                         contact_seq[np.maximum(0, i - 1) : np.minimum(N, i + 1), :],
                         axis=0,
                     )
-                contact_seq_smooth, contact_point = span_contact_points(
-                    contact_seq_smooth.astype(bool), contact_surface
+                # Objects at the origin, so world rays are object-frame rays.
+                for obj in ("right_object", "left_object"):
+                    adr = mj_model.jnt_qposadr[mj_model.joint(f"{obj}_collision_joint").id]
+                    mj_data.qpos[adr : adr + 7] = [0, 0, 0, 1, 0, 0, 0]
+                mujoco.mj_kinematics(mj_model, mj_data)
+                contact_seq_smooth, contact_point, contact_normal = span_contact_points(
+                    contact_seq_smooth.astype(bool),
+                    contact_surface,
+                    contact_surface_normal,
+                    surface_along_normal,
                 )
                 # One fingertip point per slot over all kept frames, for the
                 # fixed track_object_* sites that generate_xml.py places.
@@ -462,6 +529,8 @@ def main(
                     contact_pos_left = avg_contact_pos[5:, :]
                     contact_point_right = contact_point[:, :5]
                     contact_point_left = contact_point[:, 5:]
+                    contact_normal_right = contact_normal[:, :5]
+                    contact_normal_left = contact_normal[:, 5:]
                 elif embodiment_type == "right":
                     contact_right = contact_seq_smooth[:, :5]
                     contact_pos_right = avg_contact_pos[:5]
@@ -469,6 +538,8 @@ def main(
                     contact_left = np.zeros_like(contact_right)
                     contact_pos_left = np.zeros_like(contact_pos_right)
                     contact_point_left = np.zeros_like(contact_point_right)
+                    contact_normal_right = contact_normal[:, :5]
+                    contact_normal_left = np.zeros_like(contact_normal_right)
                 elif embodiment_type == "left":
                     contact_left = contact_seq_smooth[:, 5:]
                     contact_pos_left = avg_contact_pos[5:]
@@ -476,6 +547,8 @@ def main(
                     contact_right = np.zeros_like(contact_left)
                     contact_pos_right = np.zeros_like(contact_pos_left)
                     contact_point_right = np.zeros_like(contact_point_left)
+                    contact_normal_left = contact_normal[:, 5:]
+                    contact_normal_right = np.zeros_like(contact_normal_left)
                 else:
                     raise ValueError(f"Invalid hand type: {embodiment_type}")
                 # save contact_seq_smooth to npz
@@ -495,10 +568,18 @@ def main(
                     contact_pos_right=contact_pos_right,
                     # Per frame, the object-surface point of the contact span:
                     # the mean over the span of the surface point nearest the
-                    # fingertip, in the frame of contact_object_<side>; zero
-                    # off contact. It does not depend on the hand that touched.
+                    # fingertip, moved along the span normal onto the surface,
+                    # in the frame of contact_object_<side>; zero off contact.
+                    # It does not depend on the hand that touched.
                     contact_point_left=contact_point_left,
                     contact_point_right=contact_point_right,
+                    # Per frame, the outward unit normal of the contact span:
+                    # the normalized mean over the span of the direction from
+                    # the surface point to the fingertip, same frame and zeros
+                    # as contact_point_<side>. IK offsets the robot fingertip
+                    # along it by the fingertip collision radius.
+                    contact_normal_left=contact_normal_left,
+                    contact_normal_right=contact_normal_right,
                     contact_object_left=object_list[1],
                     contact_object_right=object_list[0],
                 )

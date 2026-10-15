@@ -2,10 +2,13 @@
 
 This is a simplified version of IK based on mink.
 No act scene or open-hand support. When detect_contact.py wrote per-span
-object-surface contact points, a finger in contact tracks its point with the
-surface of its own collision geom (ContactPointTask) instead of the human
-fingertip, and the output carries the per-frame points for the MJWP contact
-reward (see contact_targets). With object_clearance set, the hand
+object-surface contact points and normals, the fingertip site of a finger in
+contact tracks the point moved out along the normal by the radius of the
+fingertip collision geom, so the geom end touches the surface with its tip.
+The target blends from the human fingertip to that point over the first
+contact_ramp_s of each span and back over the last (see contact_targets and
+contact_blend_weights), and the output carries the contact points for the MJWP
+contact reward. With object_clearance set, the hand
 collision geoms keep that distance from the object and fixture collision geoms:
 a hard limit stops the hand moving in, and PenetrationTask pushes out geoms the
 moving object stepped into, so the reference does not ask MJWP to hold fingers
@@ -175,7 +178,7 @@ def fingertip_geom(model, site_name):
     """The one hand collision geom on the body of a fingertip site.
 
     Every SPIDER hand puts a single collision_hand_* geom on the fingertip-site
-    body; the contact task and the MJWP contact reward measure from its surface.
+    body; ik_fast offsets the contact target by its radius.
     """
     body = model.site_bodyid[model.site(site_name).id]
     geoms = [
@@ -191,72 +194,86 @@ def fingertip_geom(model, site_name):
     return geoms[0]
 
 
-class ContactPointTask(mink.Task):
-    """Put each fingertip collision geom on its object-surface contact point.
+# How far a fingertip site may sit from the center of its tip geom's end cap.
+# The Inspire and MetaHand sites sit within 0.01 mm of it; the XHand index site
+# sits 5 mm off, which would leave its contact target 5 mm wrong.
+TIP_SITE_TOLERANCE_M = 1e-3
 
-    tip_geoms[k] is finger k's collision geom and probe_geoms[k] a tiny sphere
-    on a mocap body at its contact point. For fingers in contact the error is
-    the nearest point of the geom surface minus the contact point, and the
-    Jacobian the translation Jacobian of the tip body at that surface point;
-    fingers out of contact contribute zero rows. The robot's own finger shape
-    therefore decides how it touches, with no per-robot offset. ik_fast gives it
-    finger_pos_cost, the cost of the fingertip task it replaces during contact;
-    on a bimanual stage clip a cost 10 times higher pressed the fingers 1 to 2 mm
-    into the object against PenetrationTask.
+
+def check_tip_site(model, site_name):
+    """Radius of the fingertip geom; raise if the site is not at its tip end.
+
+    The contact target puts the site at contact_point + radius * normal, which
+    puts the geom surface on the contact point only when the site is the
+    center of the geom's end cap: the center of a sphere, or one end of a
+    capsule's axis.
     """
+    site = model.site(site_name).id
+    geom = fingertip_geom(model, site_name)
+    rotation = np.zeros(9)
+    mujoco.mju_quat2Mat(rotation, model.geom_quat[geom])
+    # Site and geom share a body, so their body-frame poses compare directly.
+    local = rotation.reshape(3, 3).T @ (model.site_pos[site] - model.geom_pos[geom])
+    kind = model.geom_type[geom]
+    if kind == mujoco.mjtGeom.mjGEOM_SPHERE:
+        offset = np.linalg.norm(local)
+    elif kind == mujoco.mjtGeom.mjGEOM_CAPSULE:
+        half = model.geom_size[geom, 1]
+        offset = min(np.linalg.norm(local - [0, 0, z]) for z in (-half, half))
+    else:
+        raise ValueError(
+            f"{site_name}: tip geom {model.geom(geom).name} is "
+            f"{mujoco.mjtGeom(kind).name}, expected a sphere or capsule"
+        )
+    if offset > TIP_SITE_TOLERANCE_M:
+        raise ValueError(
+            f"site {site_name} is {offset * 1000:.2f} mm from the tip end of geom "
+            f"{model.geom(geom).name}; tolerance {TIP_SITE_TOLERANCE_M * 1000:.1f} mm"
+        )
+    return float(model.geom_size[geom, 0])
 
-    def __init__(self, tip_geoms, probe_geoms, probe_mocap_ids, cost):
-        super().__init__(cost=np.full(3 * len(tip_geoms), cost), gain=1.0, lm_damping=1e-3)
-        self.tip_geoms, self.probe_geoms = tip_geoms, probe_geoms
-        self.probe_mocap_ids = probe_mocap_ids
-        self.active = np.zeros(len(tip_geoms), dtype=bool)
-        self._fromto = np.zeros(6)
 
-    def set_targets(self, data, active, points):
-        """Contact flags (K,) and world contact points (K, 3) for this frame."""
-        self.active = np.asarray(active, dtype=bool)
-        data.mocap_pos[self.probe_mocap_ids] = points
+def contact_blend_weights(contact: np.ndarray, ramp_frames: int) -> np.ndarray:
+    """Per-frame weight (N, K) of the contact target against the human fingertip.
 
-    def _rows(self, configuration):
-        model, data = configuration.model, configuration.data
-        error = np.zeros(3 * len(self.tip_geoms))
-        jac = np.zeros((3 * len(self.tip_geoms), model.nv))
-        jacp = np.zeros((3, model.nv))
-        for k, (tip, probe) in enumerate(zip(self.tip_geoms, self.probe_geoms, strict=True)):
-            if not self.active[k]:
-                continue
-            mujoco.mj_geomDistance(model, data, tip, probe, 1.0, self._fromto)
-            surface = self._fromto[:3]
-            mujoco.mj_jac(model, data, jacp, None, surface, model.geom_bodyid[tip])
-            error[3 * k : 3 * k + 3] = surface - data.mocap_pos[self.probe_mocap_ids[k]]
-            jac[3 * k : 3 * k + 3] = jacp
-        return error, jac
-
-    def compute_error(self, configuration):
-        """Task error from _rows."""
-        return self._rows(configuration)[0]
-
-    def compute_jacobian(self, configuration):
-        """Task Jacobian from _rows."""
-        return self._rows(configuration)[1]
+    Inside a contact span the weight rises in equal steps from 0 on the frame
+    before the span to 1 on its frame ramp_frames, and falls the same way to 0
+    on the frame after it, so a span of 2 * ramp_frames frames or fewer peaks
+    below 1. Outside spans it is 0.
+    """
+    weights = np.zeros(contact.shape)
+    for k in range(contact.shape[1]):
+        edges = np.flatnonzero(np.diff(np.r_[0, contact[:, k] > 0, 0]))
+        for start, end in zip(edges[::2], edges[1::2], strict=True):
+            j = np.arange(end - start)
+            ramp = np.minimum(j + 1, end - start - j) / (ramp_frames + 1)
+            weights[start:end, k] = np.minimum(ramp, 1.0)
+    return weights
 
 
 def contact_targets(
-    contact: np.ndarray, local_points: np.ndarray, object_pose: np.ndarray
+    contact: np.ndarray,
+    local_points: np.ndarray,
+    local_normals: np.ndarray,
+    radius: float,
+    object_pose: np.ndarray,
 ) -> np.ndarray:
-    """World-frame contact targets (N, K, 3) from object-frame span points.
+    """World-frame fingertip-site targets (N, 3) of one finger in contact.
 
-    local_points (N, K, 3) holds each fingertip's object-surface span point in
-    the frame of the object it touches, and object_pose (N, 7) that object's pose as
-    [x, y, z, qw, qx, qy, qz]. Targets move with the object; frames without
-    contact get the object origin, which the masked reward ignores.
+    local_points and local_normals (N, 3) hold the finger's object-surface span
+    point and outward normal in the frame of the object it touches, and
+    object_pose (N, 7) that object's pose as [x, y, z, qw, qx, qy, qz]. The
+    target is the point moved out along the normal by the tip geom radius, so
+    the geom surface touches the point. Targets move with the object; frames
+    without contact get the object origin, which the masked reward ignores.
     """
     targets = np.zeros(local_points.shape)
     rotation = np.zeros(9)
     for t in range(len(object_pose)):
         mujoco.mju_quat2Mat(rotation, object_pose[t, 3:])
-        world = local_points[t] @ rotation.reshape(3, 3).T + object_pose[t, :3]
-        targets[t] = np.where(contact[t][:, None] > 0, world, object_pose[t, :3])
+        local = local_points[t] + radius * local_normals[t]
+        world = rotation.reshape(3, 3) @ local + object_pose[t, :3]
+        targets[t] = world if contact[t] > 0 else object_pose[t, :3]
     return targets
 
 
@@ -285,6 +302,7 @@ def main(
     average_frame_size: int = 3,
     z_offset: float = 0.0,
     object_clearance: float | None = None,
+    contact_ramp_s: float = 0.1,
 ):
     # Resolve directories
     dataset_dir = os.path.abspath(dataset_dir)
@@ -368,9 +386,6 @@ def main(
     ref_idx["right_object"] = 12
     ref_idx["left_object"] = 13
 
-    # Load model
-    model = mujoco.MjModel.from_xml_path(model_path)
-
     # -- Viser setup (optional) --
     viser_state = {"enabled": False}
     if show_viser_viewer or save_viser:
@@ -434,48 +449,51 @@ def main(
         wrist_sites.append("left_palm")
         finger_sites.extend([f"left_{f}" for f in finger_names])
 
+    # Load model
+    model = mujoco.MjModel.from_xml_path(model_path)
+    # The IK model is a separate copy: the collision limit needs
+    # contype/conaffinity set, which the rollout model must not have (SPIDER
+    # scenes enable contact only through explicit pairs).
+    ik_model = mujoco.MjModel.from_xml_path(model_path)
+
     # -- Contact targets, one column per tracked fingertip site --
-    # World object-surface points (N, K, 3) from detect_contact.py, and the
-    # per-frame contact flags (N, K) of the kept spans.
-    contact = targets = None
+    # Per-frame contact flags (N, K) of the kept spans from detect_contact.py,
+    # the world fingertip-site targets on the object surface (N, K, 3), and the
+    # blend weight of those targets against the human fingertip (N, K).
+    contact = targets = weights = None
     sides = [s.split("_")[0] for s in finger_sites]
-    if all(f"contact_point_{s}" in loaded_data for s in set(sides)):
-        columns, local_columns, object_poses = [], [], []
+    if all(f"contact_normal_{s}" in loaded_data for s in set(sides)):
+        # The ramp spreads the step between the human fingertip and the
+        # contact target over several frames. On recordings 1, 7 and 8 of
+        # 2026-10-09 that step is 17 mm at p50 and 35 mm at p90 at span ends,
+        # and the human fingertip moves 5.9 mm per 50 Hz frame at p90; 0.1 s
+        # (5 frames, weight steps of 1/6) keeps the p90 target step at 5.9 mm.
+        ramp_frames = max(1, round(contact_ramp_s / ref_dt))
+        columns, target_columns = [], []
         for site_name, side in zip(finger_sites, sides, strict=True):
             slot = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"].index(
                 site_name[len(side) + 1 :]
             )
             obj = str(loaded_data[f"contact_object_{side}"])
-            columns.append(loaded_data[f"contact_{side}"][start_idx:end_idx, slot])
-            local_columns.append(loaded_data[f"contact_point_{side}"][start_idx:end_idx, slot])
-            object_poses.append(qpos_ref[:, ref_idx[obj]])
+            column = loaded_data[f"contact_{side}"][start_idx:end_idx, slot]
+            columns.append(column)
+            target_columns.append(
+                contact_targets(
+                    column,
+                    loaded_data[f"contact_point_{side}"][start_idx:end_idx, slot],
+                    loaded_data[f"contact_normal_{side}"][start_idx:end_idx, slot],
+                    check_tip_site(model, site_name),
+                    qpos_ref[:, ref_idx[obj]],
+                )
+            )
         contact = np.stack(columns, axis=1)
-        targets = np.stack(
-            [
-                contact_targets(contact[:, [k]], local_columns[k][:, None], pose)[:, 0]
-                for k, pose in enumerate(object_poses)
-            ],
-            axis=1,
+        targets = np.stack(target_columns, axis=1)
+        weights = contact_blend_weights(contact, ramp_frames)
+        loguru.logger.info(
+            f"Contact targets blend in over {ramp_frames} frames for {finger_sites}"
         )
 
-    # Create mink configuration. The IK model is a separate copy: the collision
-    # limit needs contype/conaffinity set, which the rollout model must not have
-    # (SPIDER scenes enable contact only through explicit pairs), and the
-    # contact task adds one probe mocap body per fingertip. Neither changes qpos.
-    ik_spec = mujoco.MjSpec.from_file(model_path)
-    if contact is not None:
-        for site_name in finger_sites:
-            probe = ik_spec.worldbody.add_body(name=f"{site_name}_contact_probe", mocap=True)
-            probe.add_geom(
-                name=f"{site_name}_contact_probe",
-                type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                size=[1e-4, 0, 0],
-                contype=0,
-                conaffinity=0,
-                group=5,
-            )
-    ik_model = ik_spec.compile()
-    assert ik_model.nq == model.nq and ik_model.nv == model.nv
+    # Create mink configuration.
     configuration = mink.Configuration(ik_model)
     data = configuration.data
     limits = [mink.ConfigurationLimit(ik_model)]
@@ -523,21 +541,24 @@ def main(
     extra_tasks = []
     if object_clearance is not None:
         extra_tasks = [PenetrationTask(limits[-1], object_clearance)]
-    contact_task = None
-    if contact is not None:
-        contact_task = ContactPointTask(
-            [fingertip_geom(ik_model, s) for s in finger_sites],
-            [ik_model.geom(f"{s}_contact_probe").id for s in finger_sites],
-            [ik_model.body_mocapid[ik_model.body(f"{s}_contact_probe").id] for s in finger_sites],
-            cost=finger_pos_cost,
-        )
-        extra_tasks.append(contact_task)
+
+    qpos_list, unlimited_steps = [], []
 
     def solve(tasks):
-        return mink.solve_ik(
-            configuration, [*tasks, *extra_tasks], sim_dt, solver, damping=1e-5,
-            limits=limits, constraints=constraints,
-        )
+        try:
+            return mink.solve_ik(
+                configuration, [*tasks, *extra_tasks], sim_dt, solver, damping=1e-5,
+                limits=limits, constraints=constraints,
+            )
+        except mink.exceptions.NoSolutionFound:
+            # A finger wedged between object parts gets push-out bounds from
+            # opposite sides that no velocity meets; for this step only
+            # PenetrationTask moves it out.
+            unlimited_steps.append(len(qpos_list))
+            return mink.solve_ik(
+                configuration, [*tasks, *extra_tasks], sim_dt, solver, damping=1e-5,
+                limits=limits[:1], constraints=constraints,
+            )
 
     # Create IK tasks
     # Cost priority: finger_pos > wrist_pos > wrist_ori
@@ -589,17 +610,15 @@ def main(
             wrist_task.set_target(mink.SE3(wxyz_xyz=np.concatenate([quat_wxyz, pos])))
 
     def set_finger_targets(t):
-        # A finger in contact follows its contact point instead of the human
-        # fingertip, whose position includes the human finger's thickness.
-        active = contact[t] > 0 if contact is not None else np.zeros(len(finger_sites), bool)
+        # A finger in contact moves from the human fingertip, whose position
+        # includes the human finger's thickness, to its contact target.
         for k, (finger_task, site_name) in enumerate(zip(finger_tasks, finger_sites, strict=True)):
             pos = qpos_ref[t, ref_idx[site_name], :3]
+            if weights is not None:
+                pos = (1.0 - weights[t, k]) * pos + weights[t, k] * targets[t, k]
             finger_task.set_target(
                 mink.SE3(wxyz_xyz=np.array([1.0, 0.0, 0.0, 0.0, *pos]))
             )
-            finger_task.set_position_cost(0.0 if active[k] else finger_pos_cost)
-        if contact_task is not None:
-            contact_task.set_targets(data, active, targets[t])
 
     # -- Phase 1: Initialize wrist (frame 0) --
     loguru.logger.info("Phase 1: Initializing wrist position...")
@@ -622,7 +641,6 @@ def main(
 
     # -- Main IK loop --
     loguru.logger.info(f"Running IK for {num_frames} frames...")
-    qpos_list = []
     images = []
 
     if save_video:
@@ -682,6 +700,11 @@ def main(
                 loguru.logger.info(f"  Frame {t}/{num_frames}")
 
     qpos_list = np.array(qpos_list)
+    if unlimited_steps:
+        loguru.logger.warning(
+            f"collision limit infeasible on {len(unlimited_steps)} IK steps in "
+            f"{len(set(unlimited_steps))} frames; those steps ran without it"
+        )
 
     # -- Post-processing: moving average filter --
     def moving_average_filter(signal_data, window_size=5):
@@ -704,14 +727,13 @@ def main(
             "contact": filter_columns(contact)[1:],
             "contact_pos": filter_columns(targets)[1:],
         }
-        geom_ids = [fingertip_geom(model, s) for s in finger_sites]
+        site_ids = [model.site(s).id for s in finger_sites]
         robot_task_info = Path(processed_dir_robot).parent / "task_info.json"
         info = json.loads(robot_task_info.read_text()) if robot_task_info.exists() else {}
-        info.pop("contact_site_ids", None)
-        info["contact_geom_ids"] = geom_ids
+        info["contact_site_ids"] = site_ids
         robot_task_info.write_text(json.dumps(info, indent=2))
         loguru.logger.info(
-            f"Contact targets for {finger_sites}; geom ids {geom_ids} in {robot_task_info}"
+            f"Contact targets for {finger_sites}; site ids {site_ids} in {robot_task_info}"
         )
 
     # -- Compute qvel via finite differences --

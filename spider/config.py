@@ -147,10 +147,8 @@ class Config:
     vel_rew_scale: float = 0.0001
     terminal_rew_scale: float = 1.0
     contact_rew_scale: float = 0.0
-    # Contact reward measures from these sites, or from the surface of these
-    # fingertip collision geoms (capsule or sphere) when set; from task_info.json.
+    # Contact reward measures from these sites to contact_pos; from task_info.json.
     contact_site_ids: list = field(default_factory=list)
-    contact_geom_ids: list = field(default_factory=list)
 
     # === VISUALIZATION CONFIGURATION ===
     show_viewer: bool = True
@@ -520,21 +518,14 @@ def process_config(config: Config):
 
     # override contact site ids
     if config.contact_rew_scale > 0.0:
-        if "contact_geom_ids" in task_info:
-            config.contact_geom_ids = task_info["contact_geom_ids"]
-            loguru.logger.info(
-                f"overriding contact_geom_ids: {config.contact_geom_ids} from task_info.json"
-            )
-        elif "contact_site_ids" in task_info:
-            config.contact_site_ids = task_info["contact_site_ids"]
-            loguru.logger.info(
-                f"overriding contact_site_ids: {config.contact_site_ids} from task_info.json"
-            )
-        else:
+        if "contact_site_ids" not in task_info:
             raise ValueError(
-                "contact_geom_ids or contact_site_ids not found in task_info.json "
-                "while contact_rew_scale > 0.0"
+                "contact_site_ids not found in task_info.json while contact_rew_scale > 0.0"
             )
+        config.contact_site_ids = task_info["contact_site_ids"]
+        loguru.logger.info(
+            f"overriding contact_site_ids: {config.contact_site_ids} from task_info.json"
+        )
 
     # set seed
     np.random.seed(config.seed)
