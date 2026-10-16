@@ -13,5 +13,5 @@ rerun-sdk==0.26.2
 ipdb==0.13.13
 pymeshlab==2025.7
 open3d==0.19.0
-mujoco-warp @ git+https://github.com/google-deepmind/mujoco_warp@5d5a6450a7699e695f1767efd7715251713da2ac
+mujoco-warp==3.16.0
 newton[examples] @ git+https://github.com/newton-physics/newton.git@e15698684b6bfa4c501d49fe938a2837e112380c

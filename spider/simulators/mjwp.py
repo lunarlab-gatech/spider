@@ -22,8 +22,6 @@ import numpy as np
 import torch
 import warp as wp
 
-# NOTE: this is a hacky solution to make sure domain randomization works for contact margin. Otherwise, it will create a surrogate memory for all worlds and we cannot override each individual world's contact parameters.
-# mjwarp._src.io.MAX_WORLDS = 1024
 from spider.config import Config
 from spider.math import quat_sub
 
@@ -43,15 +41,25 @@ class MJWPEnv:
     model_wp: mjwarp.Model
     data_wp: mjwarp.Data
     data_wp_prev: mjwarp.Data
-    graph: wp.ScopedCapture.Graph
+    graph: wp.Graph
     # Device alias used for Warp allocations/launches (e.g., "cuda:1" or "cpu")
     device: str
     num_worlds: int
 
 
+def copy_from_torch(dst: wp.array, src: torch.Tensor) -> None:
+    """Copy a torch tensor into a Warp array of the array's element type.
+
+    The tensor's trailing dims become the vector, quaternion or matrix type of
+    dst (xfrc_applied is spatial_vector, xmat mat33, ...): wp.copy rejects
+    arrays whose element sizes differ.
+    """
+    wp.copy(dst, wp.from_torch(src, dtype=dst.dtype))
+
+
 def _compile_step(
     model_wp: mjwarp.Model, data_wp: mjwarp.Data
-) -> wp.ScopedCapture.Graph:
+) -> wp.Graph:
     """Warm up and capture a CUDA graph that runs a single mjwarp.step."""
 
     def _step_once():
@@ -851,15 +859,13 @@ def set_qpos(config: Config, env: MJWPEnv, qpos: torch.Tensor):
     qpos = qpos.to(config.device)
     if qpos.dim() == 1:
         qpos = qpos.unsqueeze(0).repeat(env.num_worlds, 1)
-    wp.copy(env.data_wp.qpos, wp.from_torch(qpos))
+    copy_from_torch(env.data_wp.qpos, qpos)
     # reset velocities/time as well for consistency
     zero_qvel = torch.zeros((env.num_worlds, env.model_cpu.nv), device=config.device)
-    wp.copy(env.data_wp.qvel, wp.from_torch(zero_qvel))
-    wp.copy(
+    copy_from_torch(env.data_wp.qvel, zero_qvel)
+    copy_from_torch(
         env.data_wp.time,
-        wp.from_torch(
-            torch.zeros(env.num_worlds, dtype=torch.float32, device=config.device)
-        ),
+        torch.zeros(env.num_worlds, dtype=torch.float32, device=config.device),
     )
 
 
@@ -1003,7 +1009,7 @@ def apply_perturbation(config: Config, env: MJWPEnv):
     if left_obj_id != -1:
         xfrc_applied[:, left_obj_id, :3] = config.perturb_force
         xfrc_applied[:, left_obj_id, 3:] = config.perturb_torque
-    wp.copy(env.data_wp.xfrc_applied, wp.from_torch(xfrc_applied))
+    copy_from_torch(env.data_wp.xfrc_applied, xfrc_applied)
     return env
 
 
@@ -1016,7 +1022,7 @@ def step_env(config: Config, env: MJWPEnv, ctrl_mujoco: torch.Tensor):
         # apply perturbation
         env = apply_perturbation(config, env)
         # step control
-        wp.copy(env.data_wp.ctrl, wp.from_torch(ctrl_mujoco.to(torch.float32)))
+        copy_from_torch(env.data_wp.ctrl, ctrl_mujoco.to(torch.float32))
         wp.capture_launch(env.graph)
 
 
@@ -1075,7 +1081,7 @@ def load_env_params(config: Config, env: MJWPEnv, env_param: dict):
                 qpos_override_th[:, -7:-5] + env_param["xy_offset"]
             )
 
-        wp.copy(env.data_wp.qpos, wp.from_torch(qpos_override_th))
+        copy_from_torch(env.data_wp.qpos, qpos_override_th)
 
     # update object actuator gains
     if "kp" in env_param or "kd" in env_param:
@@ -1124,13 +1130,17 @@ def load_env_params(config: Config, env: MJWPEnv, env_param: dict):
                     wp.copy(
                         env.model_wp.actuator_gainprm,
                         wp.from_numpy(
-                            gain_full, dtype=wp.float32, device=config.device
+                            gain_full[None],
+                            dtype=env.model_wp.actuator_gainprm.dtype,
+                            device=config.device,
                         ),
                     )
                     wp.copy(
                         env.model_wp.actuator_biasprm,
                         wp.from_numpy(
-                            bias_full, dtype=wp.float32, device=config.device
+                            bias_full[None],
+                            dtype=env.model_wp.actuator_biasprm.dtype,
+                            device=config.device,
                         ),
                     )
                 else:
@@ -1162,55 +1172,55 @@ def _broadcast_state(data_wp, num_worlds: int):
     else:
         time_repeated = time0.repeat(num_worlds, 1)
 
-    wp.copy(data_wp.qpos, wp.from_torch(qpos0.repeat(num_worlds, 1)))
-    wp.copy(data_wp.qvel, wp.from_torch(qvel0.repeat(num_worlds, 1)))
-    wp.copy(data_wp.time, wp.from_torch(time_repeated))
-    wp.copy(data_wp.ctrl, wp.from_torch(ctrl0.repeat(num_worlds, 1)))
+    copy_from_torch(data_wp.qpos, qpos0.repeat(num_worlds, 1))
+    copy_from_torch(data_wp.qvel, qvel0.repeat(num_worlds, 1))
+    copy_from_torch(data_wp.time, time_repeated)
+    copy_from_torch(data_wp.ctrl, ctrl0.repeat(num_worlds, 1))
 
     # Additional core state variables
     qacc0 = wp.to_torch(data_wp.qacc)[:1]
-    wp.copy(data_wp.qacc, wp.from_torch(qacc0.repeat(num_worlds, 1)))
+    copy_from_torch(data_wp.qacc, qacc0.repeat(num_worlds, 1))
 
     act0 = wp.to_torch(data_wp.act)[:1]
-    wp.copy(data_wp.act, wp.from_torch(act0.repeat(num_worlds, 1)))
+    copy_from_torch(data_wp.act, act0.repeat(num_worlds, 1))
 
     act_dot0 = wp.to_torch(data_wp.act_dot)[:1]
-    wp.copy(data_wp.act_dot, wp.from_torch(act_dot0.repeat(num_worlds, 1)))
+    copy_from_torch(data_wp.act_dot, act_dot0.repeat(num_worlds, 1))
 
     # Forces and applied forces
     qfrc_applied0 = wp.to_torch(data_wp.qfrc_applied)[:1]
-    wp.copy(data_wp.qfrc_applied, wp.from_torch(qfrc_applied0.repeat(num_worlds, 1)))
+    copy_from_torch(data_wp.qfrc_applied, qfrc_applied0.repeat(num_worlds, 1))
 
     xfrc_applied0 = wp.to_torch(data_wp.xfrc_applied)[:1]
-    wp.copy(data_wp.xfrc_applied, wp.from_torch(xfrc_applied0.repeat(num_worlds, 1, 1)))
+    copy_from_torch(data_wp.xfrc_applied, xfrc_applied0.repeat(num_worlds, 1, 1))
 
     # Mocap data
     mocap_pos0 = wp.to_torch(data_wp.mocap_pos)[:1]
-    wp.copy(data_wp.mocap_pos, wp.from_torch(mocap_pos0.repeat(num_worlds, 1, 1)))
+    copy_from_torch(data_wp.mocap_pos, mocap_pos0.repeat(num_worlds, 1, 1))
 
     mocap_quat0 = wp.to_torch(data_wp.mocap_quat)[:1]
-    wp.copy(data_wp.mocap_quat, wp.from_torch(mocap_quat0.repeat(num_worlds, 1, 1)))
+    copy_from_torch(data_wp.mocap_quat, mocap_quat0.repeat(num_worlds, 1, 1))
 
     # Spatial transformations
     xpos0 = wp.to_torch(data_wp.xpos)[:1]
-    wp.copy(data_wp.xpos, wp.from_torch(xpos0.repeat(num_worlds, 1, 1)))
+    copy_from_torch(data_wp.xpos, xpos0.repeat(num_worlds, 1, 1))
 
     xquat0 = wp.to_torch(data_wp.xquat)[:1]
-    wp.copy(data_wp.xquat, wp.from_torch(xquat0.repeat(num_worlds, 1, 1)))
+    copy_from_torch(data_wp.xquat, xquat0.repeat(num_worlds, 1, 1))
 
     xmat0 = wp.to_torch(data_wp.xmat)[:1]
-    wp.copy(data_wp.xmat, wp.from_torch(xmat0.repeat(num_worlds, 1, 1, 1)))
+    copy_from_torch(data_wp.xmat, xmat0.repeat(num_worlds, 1, 1, 1))
 
     # Geometry positions
     geom_xpos0 = wp.to_torch(data_wp.geom_xpos)[:1]
-    wp.copy(data_wp.geom_xpos, wp.from_torch(geom_xpos0.repeat(num_worlds, 1, 1)))
+    copy_from_torch(data_wp.geom_xpos, geom_xpos0.repeat(num_worlds, 1, 1))
 
     geom_xmat0 = wp.to_torch(data_wp.geom_xmat)[:1]
-    wp.copy(data_wp.geom_xmat, wp.from_torch(geom_xmat0.repeat(num_worlds, 1, 1, 1)))
+    copy_from_torch(data_wp.geom_xmat, geom_xmat0.repeat(num_worlds, 1, 1, 1))
 
     # Site positions
     site_xpos0 = wp.to_torch(data_wp.site_xpos)[:1]
-    wp.copy(data_wp.site_xpos, wp.from_torch(site_xpos0.repeat(num_worlds, 1, 1)))
+    copy_from_torch(data_wp.site_xpos, site_xpos0.repeat(num_worlds, 1, 1))
 
 
 def sync_env(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
@@ -1223,7 +1233,11 @@ def sync_env(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
 
 
 def sync_env_mujoco(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
-    """Sync state from mj_data to env.data_wp"""
+    """Sync state from mj_data to env.data_wp.
+
+    Contacts and constraint rows are not copied: mjwarp.step computes them from
+    the state before it uses them.
+    """
     # Define field mappings with their data and target shapes
     fields = [
         # Core state variables
@@ -1246,14 +1260,14 @@ def sync_env_mujoco(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
         # Spatial transformations
         ("xpos", mj_data.xpos, (env.data_wp.nworld, -1, 3)),
         ("xquat", mj_data.xquat, (env.data_wp.nworld, -1, 4)),
-        ("xmat", mj_data.xmat, (env.data_wp.nworld, -1, 9)),
+        ("xmat", mj_data.xmat, (env.data_wp.nworld, -1, 3, 3)),
         ("xipos", mj_data.xipos, (env.data_wp.nworld, -1, 3)),
-        ("ximat", mj_data.ximat, (env.data_wp.nworld, -1, 9)),
+        ("ximat", mj_data.ximat, (env.data_wp.nworld, -1, 3, 3)),
         # Geometry positions
         ("geom_xpos", mj_data.geom_xpos, (env.data_wp.nworld, -1, 3)),
-        ("geom_xmat", mj_data.geom_xmat, (env.data_wp.nworld, -1, 9)),
+        ("geom_xmat", mj_data.geom_xmat, (env.data_wp.nworld, -1, 3, 3)),
         ("site_xpos", mj_data.site_xpos, (env.data_wp.nworld, -1, 3)),
-        ("site_xmat", mj_data.site_xmat, (env.data_wp.nworld, -1, 9)),
+        ("site_xmat", mj_data.site_xmat, (env.data_wp.nworld, -1, 3, 3)),
         # Body dynamics (spatial vectors)
         ("cacc", mj_data.cacc, (env.data_wp.nworld, -1, 6)),
         ("cfrc_int", mj_data.cfrc_int, (env.data_wp.nworld, -1, 6)),
@@ -1267,36 +1281,6 @@ def sync_env_mujoco(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
         # Tendon data
         ("ten_length", mj_data.ten_length, (env.data_wp.nworld, -1)),
         ("ten_velocity", mj_data.ten_velocity, (env.data_wp.nworld, -1)),
-    ]
-
-    # Contact struct fields - these need special handling
-    contact_fields = [
-        ("dist", "contact.dist"),
-        ("pos", "contact.pos"),
-        ("frame", "contact.frame"),
-        ("includemargin", "contact.includemargin"),
-        ("friction", "contact.friction"),
-        ("solref", "contact.solref"),
-        ("solreffriction", "contact.solreffriction"),
-        ("solimp", "contact.solimp"),
-        ("dim", "contact.dim"),
-        ("geom", "contact.geom"),
-        ("efc_address", "contact.efc_address"),
-        ("worldid", "contact.worldid"),
-    ]
-
-    # Constraint (efc) fields - these are direct fields on mj_data, not nested in a struct
-    efc_fields = [
-        ("efc_type", "efc.type"),
-        ("efc_id", "efc.id"),
-        ("efc_J", "efc.J"),
-        ("efc_pos", "efc.pos"),
-        ("efc_margin", "efc.margin"),
-        ("efc_D", "efc.D"),
-        ("efc_vel", "efc.vel"),
-        ("efc_aref", "efc.aref"),
-        ("efc_frictionloss", "efc.frictionloss"),
-        ("efc_force", "efc.force"),
     ]
 
     # Copy data to all environments
@@ -1331,59 +1315,10 @@ def sync_env_mujoco(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
             elif tensor.dim() == 3:
                 tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1, 1, 1).squeeze(1)
         elif len(target_shape) == 4:
-            tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1, 1, 1)
+            # Rotation matrices: MuJoCo stores (n, 9), Warp mat33 (n, 3, 3).
+            tensor = tensor.reshape(target_shape[1:]).unsqueeze(0).repeat(target_shape[0], 1, 1, 1)
 
-        wp.copy(getattr(env.data_wp, field_name), wp.from_torch(tensor))
-
-    # Handle contact struct fields
-    for mj_field, wp_field in contact_fields:
-        if hasattr(mj_data.contact, mj_field):
-            source_data = getattr(mj_data.contact, mj_field)
-            source_data_np = np.array(source_data, dtype=np.float32)
-            tensor = torch.from_numpy(source_data_np).to(config.device)
-
-            # Handle scalar fields
-            if tensor.dim() == 0:
-                tensor = tensor.unsqueeze(0)
-
-            # Reshape for batched environments
-            if tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1)
-            elif tensor.dim() == 2:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1)
-            elif tensor.dim() == 3:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1, 1)
-
-            # Get the destination field using nested attribute access
-            dst_obj = env.data_wp
-            for attr in wp_field.split("."):
-                dst_obj = getattr(dst_obj, attr)
-            wp.copy(dst_obj, wp.from_torch(tensor))
-
-    # Handle efc fields - these are direct fields on mj_data
-    for mj_field, wp_field in efc_fields:
-        if hasattr(mj_data, mj_field):
-            source_data = getattr(mj_data, mj_field)
-            source_data_np = np.array(source_data, dtype=np.float32)
-            tensor = torch.from_numpy(source_data_np).to(config.device)
-
-            # Handle scalar fields
-            if tensor.dim() == 0:
-                tensor = tensor.unsqueeze(0)
-
-            # Reshape for batched environments
-            if tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1)
-            elif tensor.dim() == 2:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1)
-            elif tensor.dim() == 3:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1, 1)
-
-            # Get the destination field using nested attribute access
-            dst_obj = env.data_wp
-            for attr in wp_field.split("."):
-                dst_obj = getattr(dst_obj, attr)
-            wp.copy(dst_obj, wp.from_torch(tensor))
+        copy_from_torch(getattr(env.data_wp, field_name), tensor)
 
     return env
 
@@ -1470,37 +1405,37 @@ def copy_sample_state(
     ten_velocity[dst_idx] = ten_velocity[src_idx]
 
     # Copy back to warp arrays
-    wp.copy(env.data_wp.qpos, wp.from_torch(qpos))
-    wp.copy(env.data_wp.qvel, wp.from_torch(qvel))
-    wp.copy(env.data_wp.qacc, wp.from_torch(qacc))
-    wp.copy(env.data_wp.time, wp.from_torch(time_arr))
-    wp.copy(env.data_wp.ctrl, wp.from_torch(ctrl))
-    wp.copy(env.data_wp.act, wp.from_torch(act))
-    wp.copy(env.data_wp.act_dot, wp.from_torch(act_dot))
-    wp.copy(env.data_wp.qacc_warmstart, wp.from_torch(qacc_warmstart))
-    wp.copy(env.data_wp.qfrc_applied, wp.from_torch(qfrc_applied))
-    wp.copy(env.data_wp.xfrc_applied, wp.from_torch(xfrc_applied))
-    wp.copy(env.data_wp.energy, wp.from_torch(energy))
-    wp.copy(env.data_wp.mocap_pos, wp.from_torch(mocap_pos))
-    wp.copy(env.data_wp.mocap_quat, wp.from_torch(mocap_quat))
-    wp.copy(env.data_wp.xpos, wp.from_torch(xpos))
-    wp.copy(env.data_wp.xquat, wp.from_torch(xquat))
-    wp.copy(env.data_wp.xmat, wp.from_torch(xmat))
-    wp.copy(env.data_wp.xipos, wp.from_torch(xipos))
-    wp.copy(env.data_wp.ximat, wp.from_torch(ximat))
-    wp.copy(env.data_wp.geom_xpos, wp.from_torch(geom_xpos))
-    wp.copy(env.data_wp.geom_xmat, wp.from_torch(geom_xmat))
-    wp.copy(env.data_wp.site_xpos, wp.from_torch(site_xpos))
-    wp.copy(env.data_wp.site_xmat, wp.from_torch(site_xmat))
-    wp.copy(env.data_wp.cacc, wp.from_torch(cacc))
-    wp.copy(env.data_wp.cfrc_int, wp.from_torch(cfrc_int))
-    wp.copy(env.data_wp.cfrc_ext, wp.from_torch(cfrc_ext))
-    wp.copy(env.data_wp.sensordata, wp.from_torch(sensordata))
-    wp.copy(env.data_wp.actuator_length, wp.from_torch(actuator_length))
-    wp.copy(env.data_wp.actuator_velocity, wp.from_torch(actuator_velocity))
-    wp.copy(env.data_wp.actuator_force, wp.from_torch(actuator_force))
-    wp.copy(env.data_wp.ten_length, wp.from_torch(ten_length))
-    wp.copy(env.data_wp.ten_velocity, wp.from_torch(ten_velocity))
+    copy_from_torch(env.data_wp.qpos, qpos)
+    copy_from_torch(env.data_wp.qvel, qvel)
+    copy_from_torch(env.data_wp.qacc, qacc)
+    copy_from_torch(env.data_wp.time, time_arr)
+    copy_from_torch(env.data_wp.ctrl, ctrl)
+    copy_from_torch(env.data_wp.act, act)
+    copy_from_torch(env.data_wp.act_dot, act_dot)
+    copy_from_torch(env.data_wp.qacc_warmstart, qacc_warmstart)
+    copy_from_torch(env.data_wp.qfrc_applied, qfrc_applied)
+    copy_from_torch(env.data_wp.xfrc_applied, xfrc_applied)
+    copy_from_torch(env.data_wp.energy, energy)
+    copy_from_torch(env.data_wp.mocap_pos, mocap_pos)
+    copy_from_torch(env.data_wp.mocap_quat, mocap_quat)
+    copy_from_torch(env.data_wp.xpos, xpos)
+    copy_from_torch(env.data_wp.xquat, xquat)
+    copy_from_torch(env.data_wp.xmat, xmat)
+    copy_from_torch(env.data_wp.xipos, xipos)
+    copy_from_torch(env.data_wp.ximat, ximat)
+    copy_from_torch(env.data_wp.geom_xpos, geom_xpos)
+    copy_from_torch(env.data_wp.geom_xmat, geom_xmat)
+    copy_from_torch(env.data_wp.site_xpos, site_xpos)
+    copy_from_torch(env.data_wp.site_xmat, site_xmat)
+    copy_from_torch(env.data_wp.cacc, cacc)
+    copy_from_torch(env.data_wp.cfrc_int, cfrc_int)
+    copy_from_torch(env.data_wp.cfrc_ext, cfrc_ext)
+    copy_from_torch(env.data_wp.sensordata, sensordata)
+    copy_from_torch(env.data_wp.actuator_length, actuator_length)
+    copy_from_torch(env.data_wp.actuator_velocity, actuator_velocity)
+    copy_from_torch(env.data_wp.actuator_force, actuator_force)
+    copy_from_torch(env.data_wp.ten_length, ten_length)
+    copy_from_torch(env.data_wp.ten_velocity, ten_velocity)
 
 
 def _copy_state(src: mjwarp.Data, dst: mjwarp.Data):

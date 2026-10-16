@@ -23,7 +23,7 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from spider.config import Config
-from spider.simulators.mjwp import _broadcast_state, _copy_state
+from spider.simulators.mjwp import _broadcast_state, _copy_state, copy_from_torch
 
 # --
 # Key functions
@@ -541,16 +541,16 @@ def copy_sample_state(
     xfrc_applied[dst_idx] = xfrc_applied[src_idx]
 
     # Copy back to warp arrays
-    wp.copy(env.sim.wp_data.qpos, wp.from_torch(qpos))
-    wp.copy(env.sim.wp_data.qvel, wp.from_torch(qvel))
-    wp.copy(env.sim.wp_data.qacc, wp.from_torch(qacc))
-    wp.copy(env.sim.wp_data.time, wp.from_torch(time_arr))
-    wp.copy(env.sim.wp_data.ctrl, wp.from_torch(ctrl))
-    wp.copy(env.sim.wp_data.act, wp.from_torch(act))
-    wp.copy(env.sim.wp_data.act_dot, wp.from_torch(act_dot))
-    wp.copy(env.sim.wp_data.qacc_warmstart, wp.from_torch(qacc_warmstart))
-    wp.copy(env.sim.wp_data.qfrc_applied, wp.from_torch(qfrc_applied))
-    wp.copy(env.sim.wp_data.xfrc_applied, wp.from_torch(xfrc_applied))
+    copy_from_torch(env.sim.wp_data.qpos, qpos)
+    copy_from_torch(env.sim.wp_data.qvel, qvel)
+    copy_from_torch(env.sim.wp_data.qacc, qacc)
+    copy_from_torch(env.sim.wp_data.time, time_arr)
+    copy_from_torch(env.sim.wp_data.ctrl, ctrl)
+    copy_from_torch(env.sim.wp_data.act, act)
+    copy_from_torch(env.sim.wp_data.act_dot, act_dot)
+    copy_from_torch(env.sim.wp_data.qacc_warmstart, qacc_warmstart)
+    copy_from_torch(env.sim.wp_data.qfrc_applied, qfrc_applied)
+    copy_from_torch(env.sim.wp_data.xfrc_applied, xfrc_applied)
 
 
 def sync_env(config: Config, env):

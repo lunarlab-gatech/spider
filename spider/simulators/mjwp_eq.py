@@ -23,6 +23,7 @@ import loguru
 
 from spider.config import Config
 from spider.math import quat_sub
+from spider.simulators.mjwp import copy_from_torch
 
 
 # Initialize Warp once per process
@@ -44,11 +45,11 @@ class MJWPEnv:
     # Default handles
     default_model_wp: mjwarp.Model
     default_data_wp: mjwarp.Data
-    default_graph: wp.ScopedCapture.Graph
+    default_graph: wp.Graph
     # Optional DR groups (lists aligned by index)
     dr_model_wps: list[mjwarp.Model]
     dr_data_wps: list[mjwarp.Data]
-    dr_graphs: list[wp.ScopedCapture.Graph]
+    dr_graphs: list[wp.Graph]
     # Current active group index: -1 for main, or [0..G-1] for DR groups
     active_dr_group: int
     active_annealing_group: int
@@ -60,7 +61,7 @@ class MJWPEnv:
 
 def _compile_step(
     model_wp: mjwarp.Model, data_wp: mjwarp.Data
-) -> wp.ScopedCapture.Graph:
+) -> wp.Graph:
     """
     Warm up and capture a CUDA graph that runs a single mjwarp.step.
     """
@@ -135,7 +136,7 @@ def setup_env(config: Config, ref_data: tuple[torch.Tensor, ...]) -> MJWPEnv:
         dr_model_wps: list[mjwarp.Model] = []
         dr_data_wps: list[mjwarp.Data] = []
         dr_graphs: list[
-            list[wp.ScopedCapture.Graph]
+            list[wp.Graph]
         ] = []  # its size should be (config.max_num_iterations, config.num_dr)
 
         # Precompute per-group values for pair params
@@ -414,15 +415,13 @@ def set_qpos(config: Config, env: MJWPEnv, qpos: torch.Tensor):
     qpos = qpos.to(config.device)
     if qpos.dim() == 1:
         qpos = qpos.unsqueeze(0).repeat(env.num_worlds, 1)
-    wp.copy(env.data_wp.qpos, wp.from_torch(qpos))
+    copy_from_torch(env.data_wp.qpos, qpos)
     # reset velocities/time as well for consistency
     zero_qvel = torch.zeros((env.num_worlds, env.model_cpu.nv), device=config.device)
-    wp.copy(env.data_wp.qvel, wp.from_torch(zero_qvel))
-    wp.copy(
+    copy_from_torch(env.data_wp.qvel, zero_qvel)
+    copy_from_torch(
         env.data_wp.time,
-        wp.from_torch(
-            torch.zeros(env.num_worlds, dtype=torch.float32, device=config.device)
-        ),
+        torch.zeros(env.num_worlds, dtype=torch.float32, device=config.device),
     )
 
 
@@ -648,7 +647,7 @@ def update_mocap_pos(
     )
 
     # set mocap pos
-    wp.copy(dwp.mocap_pos, wp.from_torch(mocap_pos))
+    copy_from_torch(dwp.mocap_pos, mocap_pos)
 
     return dwp
 
@@ -669,7 +668,7 @@ def step_env(config: Config, env: MJWPEnv, ctrl_mujoco: torch.Tensor):
         # data_wp -> dwp
         dwp = _copy_state(env.data_wp, dwp)
         # step control
-        wp.copy(dwp.ctrl, wp.from_torch(ctrl_mujoco.to(torch.float32)))
+        copy_from_torch(dwp.ctrl, ctrl_mujoco.to(torch.float32))
         wp.capture_launch(graph)
         # dwp -> data_wp
         env.data_wp = _copy_state(dwp, env.data_wp)
@@ -702,8 +701,10 @@ def load_env_params(env: MJWPEnv, env_param: dict):
 
 
 def sync_env(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
-    """
-    sync state from mj_data to env.data_wp
+    """Sync state from mj_data to env.data_wp.
+
+    Contacts and constraint rows are not copied: mjwarp.step computes them from
+    the state before it uses them.
     """
     # Define field mappings with their data and target shapes
     fields = [
@@ -727,14 +728,14 @@ def sync_env(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
         # Spatial transformations
         ("xpos", mj_data.xpos, (env.data_wp.nworld, -1, 3)),
         ("xquat", mj_data.xquat, (env.data_wp.nworld, -1, 4)),
-        ("xmat", mj_data.xmat, (env.data_wp.nworld, -1, 9)),
+        ("xmat", mj_data.xmat, (env.data_wp.nworld, -1, 3, 3)),
         ("xipos", mj_data.xipos, (env.data_wp.nworld, -1, 3)),
-        ("ximat", mj_data.ximat, (env.data_wp.nworld, -1, 9)),
+        ("ximat", mj_data.ximat, (env.data_wp.nworld, -1, 3, 3)),
         # Geometry positions
         ("geom_xpos", mj_data.geom_xpos, (env.data_wp.nworld, -1, 3)),
-        ("geom_xmat", mj_data.geom_xmat, (env.data_wp.nworld, -1, 9)),
+        ("geom_xmat", mj_data.geom_xmat, (env.data_wp.nworld, -1, 3, 3)),
         ("site_xpos", mj_data.site_xpos, (env.data_wp.nworld, -1, 3)),
-        ("site_xmat", mj_data.site_xmat, (env.data_wp.nworld, -1, 9)),
+        ("site_xmat", mj_data.site_xmat, (env.data_wp.nworld, -1, 3, 3)),
         # Body dynamics (spatial vectors)
         ("cacc", mj_data.cacc, (env.data_wp.nworld, -1, 6)),
         ("cfrc_int", mj_data.cfrc_int, (env.data_wp.nworld, -1, 6)),
@@ -748,36 +749,6 @@ def sync_env(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
         # Tendon data
         ("ten_length", mj_data.ten_length, (env.data_wp.nworld, -1)),
         ("ten_velocity", mj_data.ten_velocity, (env.data_wp.nworld, -1)),
-    ]
-
-    # Contact struct fields - these need special handling
-    contact_fields = [
-        ("dist", "contact.dist"),
-        ("pos", "contact.pos"),
-        ("frame", "contact.frame"),
-        ("includemargin", "contact.includemargin"),
-        ("friction", "contact.friction"),
-        ("solref", "contact.solref"),
-        ("solreffriction", "contact.solreffriction"),
-        ("solimp", "contact.solimp"),
-        ("dim", "contact.dim"),
-        ("geom", "contact.geom"),
-        ("efc_address", "contact.efc_address"),
-        ("worldid", "contact.worldid"),
-    ]
-
-    # Constraint (efc) fields - these are direct fields on mj_data, not nested in a struct
-    efc_fields = [
-        ("efc_type", "efc.type"),
-        ("efc_id", "efc.id"),
-        ("efc_J", "efc.J"),
-        ("efc_pos", "efc.pos"),
-        ("efc_margin", "efc.margin"),
-        ("efc_D", "efc.D"),
-        ("efc_vel", "efc.vel"),
-        ("efc_aref", "efc.aref"),
-        ("efc_frictionloss", "efc.frictionloss"),
-        ("efc_force", "efc.force"),
     ]
 
     # Copy data to all environments
@@ -812,58 +783,9 @@ def sync_env(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
             elif tensor.dim() == 3:
                 tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1, 1, 1).squeeze(1)
         elif len(target_shape) == 4:
-            tensor = tensor.unsqueeze(0).repeat(target_shape[0], 1, 1, 1)
+            # Rotation matrices: MuJoCo stores (n, 9), Warp mat33 (n, 3, 3).
+            tensor = tensor.reshape(target_shape[1:]).unsqueeze(0).repeat(target_shape[0], 1, 1, 1)
 
-        wp.copy(getattr(env.data_wp, field_name), wp.from_torch(tensor))
-
-    # Handle contact struct fields
-    for mj_field, wp_field in contact_fields:
-        if hasattr(mj_data.contact, mj_field):
-            source_data = getattr(mj_data.contact, mj_field)
-            source_data_np = np.array(source_data, dtype=np.float32)
-            tensor = torch.from_numpy(source_data_np).to(config.device)
-
-            # Handle scalar fields
-            if tensor.dim() == 0:
-                tensor = tensor.unsqueeze(0)
-
-            # Reshape for batched environments
-            if tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1)
-            elif tensor.dim() == 2:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1)
-            elif tensor.dim() == 3:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1, 1)
-
-            # Get the destination field using nested attribute access
-            dst_obj = env.data_wp
-            for attr in wp_field.split("."):
-                dst_obj = getattr(dst_obj, attr)
-            wp.copy(dst_obj, wp.from_torch(tensor))
-
-    # Handle efc fields - these are direct fields on mj_data
-    for mj_field, wp_field in efc_fields:
-        if hasattr(mj_data, mj_field):
-            source_data = getattr(mj_data, mj_field)
-            source_data_np = np.array(source_data, dtype=np.float32)
-            tensor = torch.from_numpy(source_data_np).to(config.device)
-
-            # Handle scalar fields
-            if tensor.dim() == 0:
-                tensor = tensor.unsqueeze(0)
-
-            # Reshape for batched environments
-            if tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1)
-            elif tensor.dim() == 2:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1)
-            elif tensor.dim() == 3:
-                tensor = tensor.unsqueeze(0).repeat(env.data_wp.nworld, 1, 1, 1)
-
-            # Get the destination field using nested attribute access
-            dst_obj = env.data_wp
-            for attr in wp_field.split("."):
-                dst_obj = getattr(dst_obj, attr)
-            wp.copy(dst_obj, wp.from_torch(tensor))
+        copy_from_torch(getattr(env.data_wp, field_name), tensor)
 
     return env

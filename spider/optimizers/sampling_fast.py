@@ -22,6 +22,7 @@ import warp as wp
 
 from spider.config import Config
 from spider.math import quat_sub
+from spider.simulators.mjwp import copy_from_torch
 from spider.optimizers.sampling import (
     _compute_weights_compiled,
     _compute_weights_impl,
@@ -122,10 +123,10 @@ def _restore_best_state_to_env(env, snapshot: dict[str, torch.Tensor], best_idx:
 
         parts = key.split(".")
         if len(parts) == 1:
-            wp.copy(getattr(env.data_wp, parts[0]), wp.from_torch(expanded))
+            copy_from_torch(getattr(env.data_wp, parts[0]), expanded)
         elif len(parts) == 2:
             parent = getattr(env.data_wp, parts[0])
-            wp.copy(getattr(parent, parts[1]), wp.from_torch(expanded))
+            copy_from_torch(getattr(parent, parts[1]), expanded)
 
 
 def check_tracking_error(
