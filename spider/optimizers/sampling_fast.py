@@ -22,12 +22,12 @@ import warp as wp
 
 from spider.config import Config
 from spider.math import quat_sub
-from spider.simulators.mjwp import copy_from_torch
 from spider.optimizers.sampling import (
     _compute_weights_compiled,
     _compute_weights_impl,
     sample_ctrls,
 )
+from spider.simulators.mjwp import copy_from_torch
 
 _MAX_ATTEMPTS = 4
 

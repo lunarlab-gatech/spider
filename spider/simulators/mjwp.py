@@ -1235,8 +1235,9 @@ def sync_env(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
 def sync_env_mujoco(config: Config, env: MJWPEnv, mj_data: mujoco.MjData):
     """Sync state from mj_data to env.data_wp.
 
-    Contacts and constraint rows are not copied: mjwarp.step computes them from
-    the state before it uses them.
+    Contacts and constraint rows are not copied: mjwarp.step runs collision
+    (which resets nacon) and make_constraint before anything reads them, so a
+    copy would be overwritten unread.
     """
     # Define field mappings with their data and target shapes
     fields = [
