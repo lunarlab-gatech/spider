@@ -131,6 +131,25 @@ def _build_ref_skeleton(server, mano_assets_root, qpos_ref, ref_idx, embodiment_
 PENETRATION_COST = 100.0
 
 
+class CollisionDisplacementLimit(mink.CollisionAvoidanceLimit):
+    """mink's CollisionAvoidanceLimit with its bound in displacement units.
+
+    solve_ik's QP variable is the step dq, so a pair at distance d may close at
+    most gain * (d - minimum_distance) in one step. mink 1.1.0 to 1.3.0 divide
+    that bound by dt, and at sim_dt 0.001 a finger may close 850 times its gap
+    in one step and pass into the object; the limit rows of a geom inside a thin
+    wall then face both ways and the finger cycles between them. mink main has
+    the dt-free bound, not yet released (CHANGELOG, Unreleased); calling the
+    parent with dt = 1 gives that bound. Drop this class once ik_fast runs on a
+    mink release that has the fix.
+    """
+
+    def compute_qp_inequalities(self, configuration, dt):
+        """mink's inequalities with the dt-free bound."""
+        del dt
+        return super().compute_qp_inequalities(configuration, 1.0)
+
+
 class PenetrationTask(mink.Task):
     """Soft push-out for hand geoms that end up inside an object.
 
@@ -498,7 +517,7 @@ def main(
         ik_model.geom_contype[hand_geoms + object_geoms] = 1
         ik_model.geom_conaffinity[hand_geoms + object_geoms] = 1
         limits.append(
-            mink.CollisionAvoidanceLimit(
+            CollisionDisplacementLimit(
                 ik_model,
                 [(hand_geoms, object_geoms)],
                 minimum_distance_from_collisions=object_clearance,
