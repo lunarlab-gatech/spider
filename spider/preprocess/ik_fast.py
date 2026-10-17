@@ -7,8 +7,9 @@ surface of its own collision geom (ContactPointTask) instead of the human
 fingertip, and the output carries the per-frame points for the MJWP contact
 reward (see contact_targets). With object_clearance set, the hand
 collision geoms keep that distance from the object and fixture collision geoms,
-and from each hand geom they share a scene contact pair with (thumb and index
-tips, the two hands): a hard limit stops the hand moving in, and
+and from each hand geom they share a scene contact pair with (palm and
+fingertips of one hand, each fingertip and the links of the other hand): a
+hard limit stops the hand moving in, and
 PenetrationTask pushes out geoms the moving object stepped into, so the
 reference does not ask MJWP to hold fingers inside an object or inside each
 other.
@@ -499,8 +500,9 @@ def main(
         ]
         ik_model.geom_contype[hand_geoms + object_geoms] = 1
         ik_model.geom_conaffinity[hand_geoms + object_geoms] = 1
-        # Hand geoms with a scene contact pair between them collide in MJWP, so a
-        # pinch that puts the thumb inside the index would start a force fight there.
+        # Hand geoms with a scene contact pair between them (palm and fingertips,
+        # the two hands) collide in MJWP, so a reference with the thumb inside the index
+        # makes MJWP push the two apart with large contact forces.
         hand_set = set(hand_geoms)
         hand_pairs = [
             ([int(ik_model.pair_geom1[p])], [int(ik_model.pair_geom2[p])])
@@ -525,10 +527,11 @@ def main(
         ]
         if object_dofs:
             constraints = [mink.DofFreezingTask(ik_model, object_dofs)]
+        kept = sum(a in hand_set and b in hand_set for a, b in limits[-1].geom_id_pairs)
         loguru.logger.info(
             f"IK keeps {len(hand_geoms)} hand geoms {object_clearance} m from "
-            f"{len(object_geoms)} object and fixture geoms and apart in {len(hand_pairs)} "
-            f"hand pairs; {len(limits[-1].geom_id_pairs)} geom pairs after mink's filters"
+            f"{len(object_geoms)} object and fixture geoms, and apart in {kept} of "
+            f"{len(hand_pairs)} scene hand pairs that mink's filters keep"
         )
 
     extra_tasks = []
