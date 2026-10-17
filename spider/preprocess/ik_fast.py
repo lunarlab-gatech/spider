@@ -6,10 +6,13 @@ object-surface contact points, a finger in contact tracks its point with the
 surface of its own collision geom (ContactPointTask) instead of the human
 fingertip, and the output carries the per-frame points for the MJWP contact
 reward (see contact_targets). With object_clearance set, the hand
-collision geoms keep that distance from the object and fixture collision geoms:
-a hard limit stops the hand moving in, and PenetrationTask pushes out geoms the
-moving object stepped into, so the reference does not ask MJWP to hold fingers
-inside an object.
+collision geoms keep that distance from the object and fixture collision geoms,
+and from each hand geom they share a scene contact pair with (palm and
+fingertips of one hand, each fingertip and the links of the other hand): a
+hard limit stops the hand moving in, and
+PenetrationTask pushes out geoms the moving object stepped into, so the
+reference does not ask MJWP to hold fingers inside an object or inside each
+other.
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.
@@ -497,10 +500,19 @@ def main(
         ]
         ik_model.geom_contype[hand_geoms + object_geoms] = 1
         ik_model.geom_conaffinity[hand_geoms + object_geoms] = 1
+        # Hand geoms with a scene contact pair between them (palm and fingertips,
+        # the two hands) collide in MJWP, so a reference with the thumb inside the index
+        # makes MJWP push the two apart with large contact forces.
+        hand_set = set(hand_geoms)
+        hand_pairs = [
+            ([int(ik_model.pair_geom1[p])], [int(ik_model.pair_geom2[p])])
+            for p in range(ik_model.npair)
+            if ik_model.pair_geom1[p] in hand_set and ik_model.pair_geom2[p] in hand_set
+        ]
         limits.append(
             mink.CollisionAvoidanceLimit(
                 ik_model,
-                [(hand_geoms, object_geoms)],
+                [(hand_geoms, object_geoms), *hand_pairs],
                 minimum_distance_from_collisions=object_clearance,
                 collision_detection_distance=object_clearance + 0.02,
             )
@@ -515,9 +527,11 @@ def main(
         ]
         if object_dofs:
             constraints = [mink.DofFreezingTask(ik_model, object_dofs)]
+        kept = sum(a in hand_set and b in hand_set for a, b in limits[-1].geom_id_pairs)
         loguru.logger.info(
             f"IK keeps {len(hand_geoms)} hand geoms {object_clearance} m from "
-            f"{len(object_geoms)} object and fixture geoms"
+            f"{len(object_geoms)} object and fixture geoms, and apart in {kept} of "
+            f"{len(hand_pairs)} scene hand pairs that mink's filters keep"
         )
 
     extra_tasks = []
