@@ -224,7 +224,8 @@ def _save_trajectory(info_list: list[dict], path: str) -> None:
     """Write the replayed control windows to trajectory_mjwp_fast.npz.
 
     Per-window arrays are stacked; qpos, qvel, time and ctrl of windows with
-    different lengths are concatenated.
+    different lengths are concatenated, and other keys whose shape differs
+    between windows are left out (the per-iteration arrays after a boost).
     """
     info_aggregated = {}
     for k in info_list[0]:
@@ -349,10 +350,11 @@ def main(config: Config):
         except Exception as e:
             loguru.logger.warning(f"Failed to start viser recording: {e}")
 
-    # Register an atexit + SIGTERM handler so timeout-killed runs still
-    # flush whatever optimization video / viser timeline was captured.
-    # Without this, mp4 + .viser are only written if main() reaches its
-    # end-of-loop save block, which fails-to-converge runs never do.
+    # Register an atexit + SIGTERM handler so a run killed by a timeout or an
+    # exception still saves what it has: the replayed windows as
+    # trajectory_mjwp_fast.partial.npz, the video and the viser timeline. The
+    # .partial name keeps trajectory_mjwp_fast.npz for runs that reach the end
+    # of main(), which the pipeline checks and the residual export reads.
     import atexit
     import os as _os
     import signal as _signal
@@ -363,11 +365,9 @@ def main(config: Config):
         if _flushed["done"]:
             return
         _flushed["done"] = True
-        # Save the windows replayed so far, so that a run stopped by a timeout
-        # leaves the trajectory up to the step it was working on.
         try:
             if config.save_info and len(info_list) > 0:
-                trajectory_path = f"{config.output_dir}/trajectory_mjwp_fast.npz"
+                trajectory_path = f"{config.output_dir}/trajectory_mjwp_fast.partial.npz"
                 _save_trajectory(info_list, trajectory_path)
                 loguru.logger.warning(
                     f"[emergency flush] Saved partial trajectory ({len(info_list)} windows) to {trajectory_path}"
@@ -599,8 +599,7 @@ def main(config: Config):
                 infos["step_rot_error"] = np.array([err_info["max_rot_error"]])
 
             succeeded = bool(infos["succeeded"][0])
-            # A local retry reloads the same state, so it can not reach an
-            # object that the attempts of this window could not move.
+            # See sampling_fast._OUT_OF_REACH_TOL.
             out_of_reach = bool(infos["out_of_reach"][0])
 
             if succeeded:
@@ -749,8 +748,6 @@ def main(config: Config):
         t_end = time.perf_counter()
         print(f"Total time: {t_end - t_start:.4f}s")
 
-    # The normal save below replaces the atexit flush.
-    _flushed["done"] = True
     if config.save_info and len(info_list) > 0:
         _save_trajectory(info_list, f"{config.output_dir}/trajectory_mjwp_fast.npz")
         loguru.logger.info(
@@ -765,6 +762,8 @@ def main(config: Config):
             fps=int(1 / config.render_dt),
         )
         loguru.logger.info(f"Saved video to {video_path}")
+    # The saves above replace the atexit flush; it stays armed until they finish.
+    _flushed["done"] = True
 
     errors = None
     if info_list:

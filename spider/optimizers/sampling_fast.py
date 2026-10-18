@@ -514,7 +514,7 @@ def make_optimize_fn_fast(optimize_once):  # noqa: D103
                 if prev_error_info is not None:
                     d_pos = abs(error_info["max_pos_error"] - prev_error_info["max_pos_error"])
                     d_rot = abs(error_info["max_rot_error"] - prev_error_info["max_rot_error"])
-                    if max(d_pos, d_rot) <= _OUT_OF_REACH_TOL:
+                    if d_pos <= _OUT_OF_REACH_TOL and d_rot <= _OUT_OF_REACH_TOL:
                         out_of_reach = True
                         loguru.logger.warning(
                             "Object out of reach: attempt {} ends at the same error as the one "
