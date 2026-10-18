@@ -12,7 +12,8 @@ fingertips of one hand, each fingertip and the links of the other hand): a
 hard limit stops the hand moving in, and
 PenetrationTask pushes out geoms the moving object stepped into, so the
 reference does not ask MJWP to hold fingers inside an object or inside each
-other.
+other. For the Inspire hand, finger joints move no faster than the hand's joint
+speeds (INSPIRE_JOINT_SPEED_DEG).
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.
@@ -172,6 +173,35 @@ class PenetrationTask(mink.Task):
     def compute_jacobian(self, configuration):
         """Task Jacobian from _rows."""
         return self._rows(configuration)[1]
+
+
+# Joint speeds of the Inspire RH56DFX hand (inspire-robots.com product page):
+# thumb lateral rotation 107 deg/s, thumb flexion 70 deg/s, four-finger flexion
+# 260 deg/s. A linkage drives the thumb intermediate and distal joints at 1.6 and
+# 2.4 times the thumb pitch, and each finger's intermediate joint at 1.0 times its
+# proximal joint (<mimic> multipliers of unitree_ros
+# robots/g1_description/inspire_hand/DFQ_right_hand.urdf, whose joint ranges
+# match the inspire assets), so those joints get the same ratio of the speed.
+INSPIRE_JOINT_SPEED_DEG = {
+    "thumb_proximal_yaw_joint": 107.0,
+    "thumb_proximal_pitch_joint": 70.0,
+    "thumb_intermediate_joint": 70.0 * 1.6,
+    "thumb_distal_joint": 70.0 * 2.4,
+    **{f"{f}_{j}_joint": 260.0 for f in ("index", "middle", "ring", "pinky") for j in ("proximal", "intermediate")},
+}
+
+
+def joint_speed_limit(model, robot_type):
+    """VelocityLimit with the hand's joint speeds, or None for hands without a speed table."""
+    if robot_type != "inspire":
+        return None
+    speeds = {
+        f"{side}_{joint}": np.deg2rad(deg)
+        for side in ("right", "left")
+        for joint, deg in INSPIRE_JOINT_SPEED_DEG.items()
+        if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}_{joint}") >= 0
+    }
+    return mink.VelocityLimit(model, speeds)
 
 
 def fingertip_geom(model, site_name):
@@ -547,7 +577,15 @@ def main(
         )
         extra_tasks.append(contact_task)
 
-    def solve(tasks):
+    # The hand can not move its fingers faster than its joint speeds, so the
+    # reference does not either; without the limit a finger can jump to another
+    # IK solution within one frame (the thumb of recording 7 at 7.10 s moved
+    # 69 deg in 20 ms). Frame 0 has no motion to limit, so the setup phases
+    # solve without it.
+    speed_limit = joint_speed_limit(ik_model, robot_type)
+    frame_limits = [*limits, speed_limit] if speed_limit is not None else limits
+
+    def solve(tasks, limits=frame_limits):
         return mink.solve_ik(
             configuration, [*tasks, *extra_tasks], sim_dt, solver, damping=1e-5,
             limits=limits, constraints=constraints,
@@ -621,7 +659,7 @@ def main(
     configuration.update()
     set_wrist_targets(0)
     for _ in range(wrist_init_steps):
-        vel = solve(tasks_wrist)
+        vel = solve(tasks_wrist, limits)
         configuration.integrate_inplace(vel, sim_dt)
         set_object_qpos(0)
 
@@ -630,7 +668,7 @@ def main(
     configuration.update()
     set_finger_targets(0)
     for _ in range(finger_init_steps):
-        vel = solve(tasks_all)
+        vel = solve(tasks_all, limits)
         configuration.integrate_inplace(vel, sim_dt)
         set_object_qpos(0)
 
