@@ -175,11 +175,12 @@ class PenetrationTask(mink.Task):
         return self._rows(configuration)[1]
 
 
-# Joint speeds of the Inspire RH56DFX hand (inspire-robots.com product page):
-# thumb lateral rotation 107 deg/s, thumb flexion 70 deg/s, four-finger flexion
-# 260 deg/s. A linkage drives the thumb intermediate and distal joints at 1.6 and
-# 2.4 times the thumb pitch, and each finger's intermediate joint at 1.0 times its
-# proximal joint (<mimic> multipliers of unitree_ros
+# Joint speeds, deg/s, per robot. Inspire: RH56DFX
+# (https://en.inspire-robots.com/product/rh56dfx/, read 2026-10-18): thumb
+# lateral rotation 107, thumb flexion 70, four-finger flexion 260. A linkage
+# drives the thumb intermediate and distal joints at 1.6 and 2.4 times the thumb
+# pitch, and each finger's intermediate joint at 1.0 times its proximal joint
+# (<mimic> multipliers of unitree_ros
 # robots/g1_description/inspire_hand/DFQ_right_hand.urdf, whose joint ranges
 # match the inspire assets), so those joints get the same ratio of the speed.
 INSPIRE_JOINT_SPEED_DEG = {
@@ -191,16 +192,16 @@ INSPIRE_JOINT_SPEED_DEG = {
 }
 
 
-def joint_speed_limit(model, robot_type):
-    """VelocityLimit with the hand's joint speeds, or None for hands without a speed table."""
-    if robot_type != "inspire":
-        return None
-    speeds = {
-        f"{side}_{joint}": np.deg2rad(deg)
-        for side in ("right", "left")
-        for joint, deg in INSPIRE_JOINT_SPEED_DEG.items()
-        if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}_{joint}") >= 0
-    }
+JOINT_SPEED_DEG = {"inspire": INSPIRE_JOINT_SPEED_DEG}
+
+
+def joint_speed_limit(model, robot_type, sides):
+    """VelocityLimit on the finger joints of each hand side; empty for robots without a speed table.
+
+    mink raises on a joint name the model does not have.
+    """
+    table = JOINT_SPEED_DEG.get(robot_type, {})
+    speeds = {f"{side}_{joint}": np.deg2rad(deg) for side in sides for joint, deg in table.items()}
     return mink.VelocityLimit(model, speeds)
 
 
@@ -582,10 +583,14 @@ def main(
     # IK solution within one frame (the thumb of recording 7 at 7.10 s moved
     # 69 deg in 20 ms). Frame 0 has no motion to limit, so the setup phases
     # solve without it.
-    speed_limit = joint_speed_limit(ik_model, robot_type)
-    frame_limits = [*limits, speed_limit] if speed_limit is not None else limits
+    sides = [s.removesuffix("_palm") for s in wrist_sites]
+    frame_limits = [*limits, joint_speed_limit(ik_model, robot_type, sides)]
+    loguru.logger.info(
+        f"IK limits {len(JOINT_SPEED_DEG.get(robot_type, {})) * len(sides)} {robot_type} "
+        "finger joints to the hand's joint speeds"
+    )
 
-    def solve(tasks, limits=frame_limits):
+    def solve(tasks, limits):
         return mink.solve_ik(
             configuration, [*tasks, *extra_tasks], sim_dt, solver, damping=1e-5,
             limits=limits, constraints=constraints,
@@ -702,7 +707,7 @@ def main(
             configuration.update()
 
             for _ in range(n_substeps):
-                vel = solve(tasks_all)
+                vel = solve(tasks_all, frame_limits)
                 configuration.integrate_inplace(vel, sim_dt)
                 set_object_qpos(t)
 
