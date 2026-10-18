@@ -31,6 +31,12 @@ from spider.simulators.mjwp import copy_from_torch
 
 _MAX_ATTEMPTS = 4
 
+# Two failed attempts that end with the same object error, to this tolerance in
+# metres and radians, mean that new controls did not move the object in the
+# window: the object is out of reach of the hand (dropped, or left on the table).
+# Further attempts and local retries from the same state then give the same error.
+_OUT_OF_REACH_TOL = 1e-6
+
 
 def _snapshot_env_state(env) -> dict[str, torch.Tensor]:
     """Clone all core state fields for all N samples into a dict of tensors."""
@@ -462,8 +468,10 @@ def make_optimize_fn_fast(optimize_once):  # noqa: D103
 
         all_infos = []
         succeeded = False
+        out_of_reach = False
         attempt = 0
         error_info = {"max_pos_error": float("inf"), "max_rot_error": float("inf")}
+        prev_error_info = None
         last_info = None
 
         while attempt < _MAX_ATTEMPTS and not succeeded:
@@ -503,6 +511,28 @@ def make_optimize_fn_fast(optimize_once):  # noqa: D103
                 succeeded = True
             else:
                 attempt += 1
+                if prev_error_info is not None:
+                    d_pos = abs(error_info["max_pos_error"] - prev_error_info["max_pos_error"])
+                    d_rot = abs(error_info["max_rot_error"] - prev_error_info["max_rot_error"])
+                    if d_pos <= _OUT_OF_REACH_TOL and d_rot <= _OUT_OF_REACH_TOL:
+                        out_of_reach = True
+                        loguru.logger.warning(
+                            "Object out of reach: attempt {} ends at the same error as the one "
+                            "before (pos={:.7f}, rot={:.7f}; change {:.2e} m, {:.2e} rad).",
+                            attempt,
+                            error_info["max_pos_error"],
+                            error_info["max_rot_error"],
+                            d_pos,
+                            d_rot,
+                        )
+                        break
+                    loguru.logger.info(
+                        "Attempt {} changes the object error by {:.2e} m, {:.2e} rad.",
+                        attempt,
+                        d_pos,
+                        d_rot,
+                    )
+                prev_error_info = error_info
                 if attempt < _MAX_ATTEMPTS:
                     loguru.logger.warning(
                         "Attempt {}/{}: tracking error exceeded (pos={:.4f}, rot={:.4f}). Retrying.",
@@ -515,7 +545,7 @@ def make_optimize_fn_fast(optimize_once):  # noqa: D103
         if not succeeded:
             loguru.logger.error(
                 "Failed to find feasible solution after {} attempts. pos={:.4f}, rot={:.4f}",
-                _MAX_ATTEMPTS,
+                attempt,
                 error_info["max_pos_error"],
                 error_info["max_rot_error"],
             )
@@ -554,6 +584,7 @@ def make_optimize_fn_fast(optimize_once):  # noqa: D103
         info_aggregated["state_snapshot"] = last_info["state_snapshot"]
         info_aggregated["best_idx"] = last_info["best_idx"]
         info_aggregated["succeeded"] = np.array([succeeded])
+        info_aggregated["out_of_reach"] = np.array([out_of_reach])
         info_aggregated["num_attempts"] = np.array(
             [attempt + 1 if succeeded else attempt]
         )
