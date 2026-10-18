@@ -165,9 +165,11 @@ def _apply_boost(
 # States and transitions (event -> action):
 #
 #   OPTIMIZE    succeed                              -> OPTIMIZE
-#               fail, local<cap                      -> LOCAL_RETRY
-#               fail, local>=cap, history            -> REVERT (first)
-#               fail, local>=cap, no history         -> DONE
+#               fail, local<cap, in reach            -> LOCAL_RETRY
+#               fail, local>=cap or out of reach,
+#                     history                        -> REVERT (first)
+#               fail, local>=cap or out of reach,
+#                     no history                     -> DONE
 #
 #   LOCAL_RETRY (transient) reload curr_cp, boost    -> (unchanged state)
 #
@@ -175,9 +177,15 @@ def _apply_boost(
 #
 #   RECOVERING  succeed, sim_step > anchor           -> OPTIMIZE (full recovery)
 #               succeed, sim_step <= anchor          -> RECOVERING (no push)
-#               fail, local<cap                      -> LOCAL_RETRY
-#               fail, local>=cap, attempts<max       -> RE-REVERT (same anchor)
-#               fail, local>=cap, attempts>=max      -> DONE
+#               fail, local<cap, in reach            -> LOCAL_RETRY
+#               fail, local>=cap or out of reach,
+#                     attempts<max                   -> RE-REVERT (same anchor)
+#               fail, local>=cap or out of reach,
+#                     attempts>=max                  -> DONE
+#
+# "Out of reach": two attempts in the window ended at the same object error
+# (sampling_fast._OUT_OF_REACH_TOL), so new controls did not move the object.
+# DONE keeps every replayed window and appends the failed window.
 #
 # "Recovery anchor" = sim_step right after the first REVERT pop. On subsequent
 # failures during recovery, we reload the *same* anchor checkpoint instead of
@@ -210,6 +218,26 @@ class _LoopCtx:
     revert_anchor_step: int | None = None
     revert_anchor_checkpoint: dict | None = None
     revert_attempts_from_anchor: int = 0
+
+
+def _save_trajectory(info_list: list[dict], path: str) -> None:
+    """Write the replayed control windows to trajectory_mjwp_fast.npz.
+
+    Per-window arrays are stacked; qpos, qvel, time and ctrl of windows with
+    different lengths are concatenated.
+    """
+    info_aggregated = {}
+    for k in info_list[0]:
+        if not isinstance(info_list[0][k], np.ndarray):
+            continue
+        vals = [info[k] for info in info_list if k in info]
+        if len(vals) == 0:
+            continue
+        if all(v.shape == vals[0].shape for v in vals):
+            info_aggregated[k] = np.stack(vals, axis=0)
+        elif k in ("qpos", "qvel", "time", "ctrl"):
+            info_aggregated[k] = np.concatenate(vals, axis=0)
+    np.savez(path, **info_aggregated)
 
 
 def main(config: Config):
@@ -269,6 +297,9 @@ def main(config: Config):
         mj_data.time = 0.0
 
     images = []
+    # Replayed control windows, in step with mj_data: _load_checkpoint cuts it
+    # back to the checkpoint it loads.
+    info_list = []
     object_trace_site_ids = []
     robot_trace_site_ids = []
     for sid in range(mj_model.nsite):
@@ -332,6 +363,17 @@ def main(config: Config):
         if _flushed["done"]:
             return
         _flushed["done"] = True
+        # Save the windows replayed so far, so that a run stopped by a timeout
+        # leaves the trajectory up to the step it was working on.
+        try:
+            if config.save_info and len(info_list) > 0:
+                trajectory_path = f"{config.output_dir}/trajectory_mjwp_fast.npz"
+                _save_trajectory(info_list, trajectory_path)
+                loguru.logger.warning(
+                    f"[emergency flush] Saved partial trajectory ({len(info_list)} windows) to {trajectory_path}"
+                )
+        except Exception as e:  # noqa: BLE001
+            loguru.logger.warning(f"[emergency flush] trajectory save failed: {e}")
         # Save partial mp4 if any frames are queued
         try:
             if config.save_video and len(images) > 0:
@@ -396,7 +438,6 @@ def main(config: Config):
     optimize = make_optimize_fn_fast(optimize_once)
 
     ctrls = ctrl_ref[: config.horizon_steps]
-    info_list = []
 
     orig_max_iters = config.max_num_iterations
     orig_env_params_list = list(config.env_params_list)
@@ -526,15 +567,6 @@ def main(config: Config):
         ctx.local_retries = 0
         _apply_boost(config, 0, orig_max_iters, orig_env_params_list, orig_noise_scale)
 
-    def _truncate_to_latest_commit():
-        if ctx.history:
-            anchor_cp = ctx.history[-1]
-            del images[anchor_cp["images_len"] :]
-            del info_list[anchor_cp["info_list_len"] :]
-        else:
-            del images[:]
-            del info_list[:]
-
     ctx = _LoopCtx()
     # sim_step is defined in the loop; keep a module-visible default for the
     # `sim_step >= max_sim_steps` terminal check.
@@ -567,6 +599,9 @@ def main(config: Config):
                 infos["step_rot_error"] = np.array([err_info["max_rot_error"]])
 
             succeeded = bool(infos["succeeded"][0])
+            # A local retry reloads the same state, so it can not reach an
+            # object that the attempts of this window could not move.
+            out_of_reach = bool(infos["out_of_reach"][0])
 
             if succeeded:
                 # --- SUCCESS ---
@@ -591,7 +626,7 @@ def main(config: Config):
                 last_snap_idx = infos["best_idx"]
                 sim_step = _replay_and_advance(sim_step, infos)
 
-            elif ctx.local_retries < config.max_local_retries:
+            elif ctx.local_retries < config.max_local_retries and not out_of_reach:
                 # --- LOCAL_RETRY ---
                 ctx.local_retries += 1
                 loguru.logger.warning(
@@ -632,7 +667,6 @@ def main(config: Config):
                         orig_env_params_list,
                         orig_noise_scale,
                     )
-                    _truncate_to_latest_commit()
                     sim_step = _replay_and_advance(sim_step, infos)
                     ctx.state = _StepState.DONE
                     break
@@ -692,7 +726,6 @@ def main(config: Config):
                 _apply_boost(
                     config, 0, orig_max_iters, orig_env_params_list, orig_noise_scale
                 )
-                _truncate_to_latest_commit()
                 sim_step = _replay_and_advance(sim_step, infos)
                 ctx.state = _StepState.DONE
                 break
@@ -716,22 +749,10 @@ def main(config: Config):
         t_end = time.perf_counter()
         print(f"Total time: {t_end - t_start:.4f}s")
 
+    # The normal save below replaces the atexit flush.
+    _flushed["done"] = True
     if config.save_info and len(info_list) > 0:
-        info_aggregated = {}
-        for k in info_list[0]:
-            if not isinstance(info_list[0][k], np.ndarray):
-                continue
-            vals = [info[k] for info in info_list if k in info]
-            if len(vals) == 0:
-                continue
-            if all(v.shape == vals[0].shape for v in vals):
-                info_aggregated[k] = np.stack(vals, axis=0)
-            elif k in ("qpos", "qvel", "time", "ctrl"):
-                info_aggregated[k] = np.concatenate(vals, axis=0)
-        np.savez(
-            f"{config.output_dir}/trajectory_mjwp_fast.npz",
-            **info_aggregated,
-        )
+        _save_trajectory(info_list, f"{config.output_dir}/trajectory_mjwp_fast.npz")
         loguru.logger.info(
             f"Saved info to {config.output_dir}/trajectory_mjwp_fast.npz"
         )
