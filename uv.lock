@@ -2905,6 +2905,7 @@ name = "spider"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "daqp" },
     { name = "google-auth" },
     { name = "gspread" },
     { name = "huggingface-hub" },
@@ -2941,6 +2942,7 @@ release = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", marker = "extra == 'release'", specifier = ">=1.43.99" },
+    { name = "daqp", specifier = ">=0.10.3" },
     { name = "google-auth" },
     { name = "gspread" },
     { name = "huggingface-hub" },
