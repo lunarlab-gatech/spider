@@ -12,7 +12,8 @@ fingertips of one hand, each fingertip and the links of the other hand): a
 hard limit stops the hand moving in, and
 PenetrationTask pushes out geoms the moving object stepped into, so the
 reference does not ask MJWP to hold fingers inside an object or inside each
-other.
+other. SidePlanes keeps each fingertip on the side of an object part that the
+human fingertip is on, which the collision limit alone does not decide.
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.
@@ -172,6 +173,97 @@ class PenetrationTask(mink.Task):
     def compute_jacobian(self, configuration):
         """Task Jacobian from _rows."""
         return self._rows(configuration)[1]
+
+
+# A fingertip gets a side plane while its human fingertip is within this distance
+# of an object or fixture geom. On recordings 1, 2, 7, 8 and 9 of 2026-10-09 the
+# robot fingertip site is within 36.3 mm (95th percentile) of the human
+# fingertip, so the plane is in place before the robot fingertip reaches the part.
+SIDE_PLANE_DISTANCE = 0.04
+_PARKED = np.array([0.0, 0.0, -1e3])
+
+
+class SidePlanes:
+    """Keep each fingertip on the side of an object part that the human fingertip is on.
+
+    The collision limit keeps a fingertip on whichever side of a part it reached
+    first, so a finger that comes past the edge of a thin part on the wrong side
+    stays there. For each fingertip whose human fingertip is outside every
+    object and fixture geom and within `distance` of one, a plane geom on a
+    mocap body is put on the tangent plane at the nearest point of that geom,
+    facing the human fingertip. A plane is a half-space in MuJoCo, so the
+    collision limit and PenetrationTask built on `pairs` keep the robot
+    fingertip geom on the human side of it, as they do for an object geom.
+    The planes of the other fingertips are parked 1 km below the scene.
+    """
+
+    def __init__(self, model, tip_geoms, object_geoms, distance=SIDE_PLANE_DISTANCE):
+        self.object_geoms, self.distance = object_geoms, distance
+        k = range(len(tip_geoms))
+        self.probes = [model.geom(f"side_probe_{i}").id for i in k]
+        self.planes = [model.geom(f"side_plane_{i}").id for i in k]
+        mocap = lambda g: model.body_mocapid[model.geom_bodyid[g]]
+        self.probe_mocap = [mocap(g) for g in self.probes]
+        self.plane_mocap = [mocap(g) for g in self.planes]
+        self.pairs = [([t], [p]) for t, p in zip(tip_geoms, self.planes, strict=True)]
+        self.active = np.zeros(len(tip_geoms), dtype=bool)
+        self._fromto = np.zeros(6)
+
+    @staticmethod
+    def add_geoms(spec, model, finger_sites):
+        """Add the probe and plane mocap geoms to the IK model spec.
+
+        EXPERIMENT XR_SIDE_END=1: also a sphere at the distal end of each fingertip capsule,
+        named side_tip_<i>, to stand for the fingertip in the side pairs.
+        """
+        if os.environ.get("XR_SIDE_END") == "1":
+            for i, site in enumerate(finger_sites):
+                g = fingertip_geom(model, site)
+                axis = np.zeros(9)
+                mujoco.mju_quat2Mat(axis, model.geom_quat[g])
+                ends = [model.geom_pos[g] + s * model.geom_size[g][1] * axis.reshape(3, 3)[:, 2] for s in (-1, 1)]
+                site_pos = model.site_pos[model.site(site).id]
+                end = min(ends, key=lambda e: np.linalg.norm(e - site_pos))
+                spec.body(model.body(model.geom_bodyid[g]).name).add_geom(
+                    name=f"side_tip_{i}", type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                    size=[model.geom_size[g][0], 0, 0], pos=end, contype=0, conaffinity=0,
+                    group=5, mass=0.0,
+                )
+        for i in range(len(finger_sites)):
+            probe = spec.worldbody.add_body(name=f"side_probe_{i}", mocap=True)
+            probe.add_geom(
+                name=f"side_probe_{i}", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[1e-4, 0, 0],
+                contype=0, conaffinity=0, group=5,
+            )
+            plane = spec.worldbody.add_body(name=f"side_plane_{i}", mocap=True, pos=_PARKED)
+            plane.add_geom(
+                name=f"side_plane_{i}", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 1],
+                contype=1, conaffinity=1, group=5,
+            )
+
+    def update(self, model, data, human_tips):
+        """Place the planes for human fingertips (K, 3); object poses must be current.
+
+        The caller runs forward kinematics afterwards to move the plane geoms."""
+        data.mocap_pos[self.probe_mocap] = human_tips
+        mujoco.mj_kinematics(model, data)
+        for k, probe in enumerate(self.probes):
+            nearest, point = self.distance, None
+            for g in self.object_geoms:
+                dist = mujoco.mj_geomDistance(model, data, probe, g, self.distance, self._fromto)
+                if dist <= 0.0:  # human fingertip inside the part: no side
+                    point = None
+                    break
+                if dist < nearest:
+                    nearest, point = dist, self._fromto[3:].copy()
+            self.active[k] = point is not None
+            mocap = self.plane_mocap[k]
+            if point is None:
+                data.mocap_pos[mocap] = _PARKED
+                data.mocap_quat[mocap] = [1.0, 0.0, 0.0, 0.0]
+                continue
+            data.mocap_pos[mocap] = point
+            mujoco.mju_quatZ2Vec(data.mocap_quat[mocap], human_tips[k] - point)  # normalizes
 
 
 def fingertip_geom(model, site_name):
@@ -441,6 +533,7 @@ def main(
     # World object-surface points (N, K, 3) from detect_contact.py, and the
     # per-frame contact flags (N, K) of the kept spans.
     contact = targets = None
+    side_planes = None
     sides = [s.split("_")[0] for s in finger_sites]
     if all(f"contact_point_{s}" in loaded_data for s in set(sides)):
         columns, local_columns, object_poses = [], [], []
@@ -466,6 +559,8 @@ def main(
     # (SPIDER scenes enable contact only through explicit pairs), and the
     # contact task adds one probe mocap body per fingertip. Neither changes qpos.
     ik_spec = mujoco.MjSpec.from_file(model_path)
+    if object_clearance is not None:
+        SidePlanes.add_geoms(ik_spec, model, finger_sites)
     if contact is not None:
         for site_name in finger_sites:
             probe = ik_spec.worldbody.add_body(name=f"{site_name}_contact_probe", mocap=True)
@@ -527,16 +622,39 @@ def main(
         ]
         if object_dofs:
             constraints = [mink.DofFreezingTask(ik_model, object_dofs)]
-        kept = sum(a in hand_set and b in hand_set for a, b in limits[-1].geom_id_pairs)
+        side_tips = (
+            [ik_model.geom(f"side_tip_{i}").id for i in range(len(finger_sites))]
+            if os.environ.get("XR_SIDE_END") == "1"
+            else [fingertip_geom(ik_model, s) for s in finger_sites]
+        )
+        ik_model.geom_contype[side_tips] = 1
+        ik_model.geom_conaffinity[side_tips] = 1
+        side_planes = SidePlanes(ik_model, side_tips, object_geoms)
+        limits.append(
+            mink.CollisionAvoidanceLimit(
+                ik_model,
+                side_planes.pairs,
+                minimum_distance_from_collisions=object_clearance,
+                collision_detection_distance=object_clearance + 0.02,
+            )
+        )
+        kept = sum(a in hand_set and b in hand_set for a, b in limits[-2].geom_id_pairs)
         loguru.logger.info(
             f"IK keeps {len(hand_geoms)} hand geoms {object_clearance} m from "
             f"{len(object_geoms)} object and fixture geoms, and apart in {kept} of "
-            f"{len(hand_pairs)} scene hand pairs that mink's filters keep"
+            f"{len(hand_pairs)} scene hand pairs that mink's filters keep, and "
+            f"{len(limits[-1].geom_id_pairs)} of {len(finger_sites)} fingertips on the human "
+            f"side of a part within {SIDE_PLANE_DISTANCE} m of the human fingertip"
         )
 
     extra_tasks = []
     if object_clearance is not None:
-        extra_tasks = [PenetrationTask(limits[-1], object_clearance)]
+        extra_tasks = [
+            PenetrationTask(limits[-2], object_clearance),
+            PenetrationTask(limits[-1], object_clearance),
+        ]
+        if os.environ.get("XR_SIDE_PUSH") == "0":  # EXPERIMENT: no side push-out
+            extra_tasks.pop()
     contact_task = None
     if contact is not None:
         contact_task = ContactPointTask(
@@ -602,6 +720,12 @@ def main(
             quat_wxyz = qpos_ref[t, ref_idx[site_name], 3:]
             wrist_task.set_target(mink.SE3(wxyz_xyz=np.concatenate([quat_wxyz, pos])))
 
+    def set_side_planes(t):
+        if side_planes is not None:
+            human_tips = np.array([qpos_ref[t, ref_idx[s], :3] for s in finger_sites])
+            side_planes.update(ik_model, data, human_tips)
+            configuration.update()
+
     def set_finger_targets(t):
         # A finger in contact follows its contact point instead of the human
         # fingertip, whose position includes the human finger's thickness.
@@ -629,6 +753,7 @@ def main(
     loguru.logger.info("Phase 2: Initializing finger positions...")
     configuration.update()
     set_finger_targets(0)
+    set_side_planes(0)
     for _ in range(finger_init_steps):
         vel = solve(tasks_all)
         configuration.integrate_inplace(vel, sim_dt)
@@ -662,6 +787,7 @@ def main(
             set_finger_targets(t)
             set_object_qpos(t)
             configuration.update()
+            set_side_planes(t)
 
             for _ in range(n_substeps):
                 vel = solve(tasks_all)
