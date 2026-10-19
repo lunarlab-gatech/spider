@@ -37,6 +37,9 @@ dependencies = [
   # bounds one IK step by gain * (d - d_min), where 1.3.0 divides it by dt.
   # Move to a release once one has the fix.
   "mink @ git+https://github.com/kevinzakka/mink@ae6759602593113ed7e5431ac7c65726ea27dc29",
+  # daqp 0.8.5 reports some feasible IK problems with equality rows as
+  # infeasible when qpsolvers passes them (lower bound -1e30); 0.10.3 solves them.
+  "daqp>=0.10.3",
 ]
 
 [project.scripts]

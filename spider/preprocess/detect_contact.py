@@ -436,7 +436,8 @@ def main(
             mujoco.mj_kinematics(mj_model, mj_data)
             contact_surface[cnt] = surface_points()
             cnt = (cnt + 1) % N
-            if cnt == (N - 1):
+            # Finalize once every frame, N - 1 included, is recorded.
+            if cnt == 0:
                 # post process contact_seq by sliding window
                 contact_seq_smooth = np.zeros_like(contact_seq)
                 for i in range(N):
