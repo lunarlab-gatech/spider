@@ -18,6 +18,10 @@ from loop_rate_limiters import RateLimiter
 from spider import ROOT
 from spider.io import get_processed_data_dir
 
+# Half thickness of the table box. The box only needs depth for its collision;
+# 25 mm is more than a hand or object step moves in one physics step.
+TABLE_HALF_THICKNESS = 0.025
+
 
 def _format_float(value: float) -> str:
     return f"{value:.6g}"
@@ -265,13 +269,29 @@ def main(
     else:
         material_name = "left_groundplane"
     floor_z = -0.001
-    mj_spec.worldbody.add_geom(
-        name="floor",
-        type=mujoco.mjtGeom.mjGEOM_PLANE,
-        size=[0, 0, 0.05],
-        pos=[0, 0, floor_z],
-        material=material_name,
-    )
+    table = task_info.get("table")
+    if table is None:
+        mj_spec.worldbody.add_geom(
+            name="floor",
+            type=mujoco.mjtGeom.mjGEOM_PLANE,
+            size=[0, 0, 0.05],
+            pos=[0, 0, floor_z],
+            material=material_name,
+        )
+    else:
+        # The measured table top (xr table): a box whose top is the floor
+        # height, so a hand past the table edge can go below it. It keeps the
+        # name "floor", so the floor pairs and the IK floor limits apply to it.
+        half_x, half_y = table["half_extents_xy"]
+        yaw = float(table["yaw_rad"])
+        mj_spec.worldbody.add_geom(
+            name="floor",
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=[half_x, half_y, TABLE_HALF_THICKNESS],
+            pos=[*table["center_xy"], floor_z - TABLE_HALF_THICKNESS],
+            quat=[np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)],
+            material=material_name,
+        )
     right_convex_dir = task_info.get("right_object_convex_dir")
     right_convex_dir = f"{dataset_dir}/{right_convex_dir}"
     left_convex_dir = task_info.get("left_object_convex_dir")
