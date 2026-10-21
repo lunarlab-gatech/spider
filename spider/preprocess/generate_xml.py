@@ -147,7 +147,8 @@ def main(
     # load robot xml as base scene
     mj_spec = mujoco.MjSpec.from_file(robot_xml_path)
     # One geom per hand link mesh (robot XMLs repeat each mesh for groups 0 and
-    # 1); hand_floor_collision pairs these with the floor.
+    # 1); hand_floor_collision pairs these with the floor. Collected before the
+    # scene geoms are added, so mj_spec.geoms holds only the robot geoms here.
     hand_link_meshes = {}
     for geom in mj_spec.geoms:
         if geom.type == mujoco.mjtGeom.mjGEOM_MESH:

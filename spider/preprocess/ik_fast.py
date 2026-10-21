@@ -8,11 +8,11 @@ fingertip, and the output carries the per-frame points for the MJWP contact
 reward (see contact_targets). With object_clearance set, the hand
 collision geoms keep that distance from the object and fixture collision geoms,
 and from each hand geom they share a scene contact pair with (palm and
-fingertips of one hand, each fingertip and the links of the other hand): a
-hard limit stops the hand moving in, and
-PenetrationTask pushes out geoms the moving object stepped into, so the
-reference does not ask MJWP to hold fingers inside an object or inside each
-other.
+fingertips of one hand, each fingertip and the links of the other hand), and
+each hand geom the scene pairs with the floor keeps it from the floor: a hard
+limit stops the hand moving in, and PenetrationTask pushes out geoms that start
+inside or that the moving object stepped into, so the reference does not ask
+MJWP to hold fingers inside an object, inside each other, or under the floor.
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.
@@ -135,10 +135,11 @@ PENETRATION_COST = 100.0
 
 
 class PenetrationTask(mink.Task):
-    """Soft push-out for hand geoms that end up inside an object.
+    """Soft push-out for hand geoms that end up inside an object or the floor.
 
     The object follows its reference and can step into the hand between frames,
-    which mink's CollisionAvoidanceLimit cannot undo: it only bounds approach.
+    and the human hand can start below the floor, which mink's
+    CollisionAvoidanceLimit cannot undo: it only bounds approach.
     For each pair closer than `clearance`, the task error is dist - clearance and
     its Jacobian the rate of change of dist, so the solver trades the push-out
     against the fingertip targets instead of failing.
@@ -498,31 +499,23 @@ def main(
             for g in geom_names("right_object_") + geom_names("left_object_") + geom_names("fixture_")
             if ik_model.geom_group[g] == 3 or "collision" in ik_model.geom(g).name
         ]
-        # Scene pairs between the floor and a hand geom (generate_xml.py
+        # Scene pairs between the floor and a geom of a hand (generate_xml.py
         # --hand-floor-collision) keep the reference above the floor as well.
+        # A hand is the body tree under the root body of its collision_hand_* geoms.
+        scene_pairs = [(int(a), int(b)) for a, b in zip(ik_model.pair_geom1, ik_model.pair_geom2)]
         floor = mujoco.mj_name2id(ik_model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
-        moving_objects = set(geom_names("right_object_") + geom_names("left_object_"))
-        floor_pairs = [
-            ([int(g)], [floor])
-            for p in range(ik_model.npair)
-            for g, other in (
-                (ik_model.pair_geom1[p], ik_model.pair_geom2[p]),
-                (ik_model.pair_geom2[p], ik_model.pair_geom1[p]),
-            )
-            if floor >= 0 and other == floor and g not in moving_objects
-        ]
-        floor_geoms = [g for (g,), _ in floor_pairs] + ([floor] if floor_pairs else [])
-        ik_model.geom_contype[hand_geoms + object_geoms + floor_geoms] = 1
-        ik_model.geom_conaffinity[hand_geoms + object_geoms + floor_geoms] = 1
+        hand_roots = {ik_model.body_rootid[ik_model.geom_bodyid[g]] for g in hand_geoms}
+        on_floor = [b if a == floor else a for a, b in scene_pairs if floor in (a, b)]
+        floor_hand = [g for g in on_floor if ik_model.body_rootid[ik_model.geom_bodyid[g]] in hand_roots]
+        floor_pairs = [([g], [floor]) for g in floor_hand]
+        collide = hand_geoms + object_geoms + floor_hand + [floor] * bool(floor_hand)
+        ik_model.geom_contype[collide] = 1
+        ik_model.geom_conaffinity[collide] = 1
         # Hand geoms with a scene contact pair between them (palm and fingertips,
         # the two hands) collide in MJWP, so a reference with the thumb inside the index
         # makes MJWP push the two apart with large contact forces.
         hand_set = set(hand_geoms)
-        hand_pairs = [
-            ([int(ik_model.pair_geom1[p])], [int(ik_model.pair_geom2[p])])
-            for p in range(ik_model.npair)
-            if ik_model.pair_geom1[p] in hand_set and ik_model.pair_geom2[p] in hand_set
-        ]
+        hand_pairs = [([a], [b]) for a, b in scene_pairs if a in hand_set and b in hand_set]
         limits.append(
             mink.CollisionAvoidanceLimit(
                 ik_model,
@@ -543,6 +536,12 @@ def main(
             constraints = [mink.DofFreezingTask(ik_model, object_dofs)]
         kept = sum(a in hand_set and b in hand_set for a, b in limits[-1].geom_id_pairs)
         kept_floor = sum(floor in (a, b) for a, b in limits[-1].geom_id_pairs)
+        if kept_floor != len(floor_pairs):
+            # A hand base moves on its own joints, so mink has no reason to drop a floor pair.
+            raise RuntimeError(
+                f"mink kept {kept_floor} of {len(floor_pairs)} scene hand-floor pairs; "
+                "the reference would go through the floor"
+            )
         loguru.logger.info(
             f"IK keeps {len(hand_geoms)} hand geoms {object_clearance} m from "
             f"{len(object_geoms)} object and fixture geoms, apart in {kept} of "

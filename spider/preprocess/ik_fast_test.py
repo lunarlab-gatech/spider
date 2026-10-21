@@ -34,7 +34,7 @@ class CollisionLimitTest(unittest.TestCase):
 
     def test_step_closes_at_most_gain_times_the_gap(self):
         """One IK step closes gain times the gap, at any dt, against an object or the floor."""
-        # Covers: mink 1.1.0 to 1.3.0 bound the step by gain * gap / dt, so at sim_dt 0.001 a fingertip crossed its whole gap into the object in one step; a floor pair dropped by mink's filters lets the hand through the floor
+        # Covers: mink 1.1.0 to 1.3.0 bound the step by gain * gap / dt, so at sim_dt 0.001 a fingertip crossed its whole gap into the object in one step; the same bound holds against a plane in the world body (the floor)
         # Owner: the mink pin in pyproject.toml (ik_fast collision limit)
         model = mujoco.MjModel.from_xml_string(_SLIDER)
         configuration = mink.Configuration(model)
