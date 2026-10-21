@@ -78,6 +78,20 @@ class Config:
     xy_offset_range: tuple[float, float] = (-0.005, 0.005)
     perturb_force: float = 0.0
     perturb_torque: float = 0.0
+    # The paired collision meshes of these bodies grow by inflate_distance (m)
+    # in the MJWP model only; the scene files keep the measured geometry. Mesh
+    # inflation, not pair margin: MuJoCo Warp 3.16 does not support a nonzero
+    # margin on the multiccd pairs these meshes form. Generated scenes set object
+    # mass from the collision geoms, so an inflated free body also gets heavier.
+    # Set both or neither.
+    inflate_bodies: list = field(default_factory=list)
+    inflate_distance: float = 0.0
+    # Cost on controls of these actuators that come closer than
+    # ctrl_limit_margin to their ctrlrange: ctrl_limit_rew_scale per unit.
+    # Set all three (margin and scale positive) or none.
+    ctrl_limit_actuators: list = field(default_factory=list)
+    ctrl_limit_margin: float = 0.0
+    ctrl_limit_rew_scale: float = 0.0
     contact_guidance: bool = False
     object_pos_actuator_names: list[str] = field(
         default_factory=lambda: [
@@ -178,6 +192,10 @@ class Config:
     right_pos_ctrl_ids: list = field(default_factory=list)
     left_pos_ctrl_ids: list = field(default_factory=list)
     contact_len: int = 0
+    # === CONTROL LIMIT COST (DERIVED) ===
+    ctrl_limit_ids: list = field(default_factory=list)
+    ctrl_limit_low: list = field(default_factory=list)
+    ctrl_limit_high: list = field(default_factory=list)
 
     # === AUTOMATICALLY SET PROPERTIES ===
     # Computed timesteps
@@ -248,6 +266,39 @@ def load_config_yaml(path: str) -> dict:
         raise ValueError(f"Config at {abs_path} did not resolve to a mapping.")
     cfg_dict.pop("hydra", None)
     return cfg_dict
+
+
+def check_robust_plan(config: Config) -> None:
+    """Reject inflate_* and ctrl_limit_* settings that would do nothing."""
+    if config.simulator != "mjwp" and (config.inflate_bodies or config.ctrl_limit_actuators):
+        raise ValueError(f"inflate_bodies and ctrl_limit_actuators need simulator mjwp, got {config.simulator}")
+    if bool(config.inflate_bodies) != (config.inflate_distance > 0):
+        raise ValueError(
+            f"inflate_bodies={list(config.inflate_bodies)} and "
+            f"inflate_distance={config.inflate_distance}: set both or neither"
+        )
+    on = (config.ctrl_limit_margin > 0, config.ctrl_limit_rew_scale > 0)
+    if bool(config.ctrl_limit_actuators) != all(on) or any(on) != all(on):
+        raise ValueError(
+            f"ctrl_limit_actuators={list(config.ctrl_limit_actuators)}, "
+            f"ctrl_limit_margin={config.ctrl_limit_margin} and "
+            f"ctrl_limit_rew_scale={config.ctrl_limit_rew_scale}: set all three or none"
+        )
+
+
+def resolve_ctrl_limits(config: Config, model: mujoco.MjModel) -> None:
+    """Fill ctrl_limit_ids, _low and _high from ctrl_limit_actuators."""
+    ids = []
+    for name in config.ctrl_limit_actuators:
+        aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        if aid < 0:
+            raise ValueError(f"ctrl_limit_actuators: no actuator {name!r} in {config.model_path}")
+        if not model.actuator_ctrllimited[aid]:
+            raise ValueError(f"ctrl_limit_actuators: actuator {name!r} has no ctrlrange")
+        ids.append(int(aid))
+    config.ctrl_limit_ids = ids
+    config.ctrl_limit_low = model.actuator_ctrlrange[ids, 0].tolist()
+    config.ctrl_limit_high = model.actuator_ctrlrange[ids, 1].tolist()
 
 
 def filter_config_fields(config_dict: dict) -> dict:
@@ -416,6 +467,7 @@ def compute_noise_schedule(config: Config) -> Config:
 
 def process_config(config: Config):
     """Process the configuration to fill in the missing fields."""
+    check_robust_plan(config)
     config = compute_steps(config)
     trace_steps_tmp = int(np.round(config.trace_dt / config.sim_dt))
     assert np.isclose(
@@ -465,6 +517,7 @@ def process_config(config: Config):
         config.nv = model.nv
         config.nu = model.nu
         config.npair = model.npair
+        resolve_ctrl_limits(config, model)
         if config.contact_guidance:
             if config.object_action_dims <= 0:
                 config.object_action_dims = (
