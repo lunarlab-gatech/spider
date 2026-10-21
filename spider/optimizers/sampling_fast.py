@@ -360,16 +360,21 @@ def make_optimize_once_fn_fast(rollout):  # noqa: D103
             env_params = [{}]
         ctrls_samples = sample_ctrls(config, ctrls, sample_params)
 
+        # Each sample scores its worst group. The first group is the kept plan:
+        # only it records states, so later groups (object_offsets) never reach
+        # the trajectory or the restored snapshot.
         min_rew = torch.full((config.num_samples,), float("inf"), device=config.device)
-        for env_param in env_params:
-            ctrls_samples, rews, terminate, rollout_info = rollout(
+        for group, env_param in enumerate(env_params):
+            ctrls_samples, rews, group_terminate, group_info = rollout(
                 config,
                 env,
                 ctrls_samples,
                 ref_slice,
                 env_param,
-                record_states=select_best,
+                record_states=select_best and group == 0,
             )
+            if group == 0:
+                terminate, rollout_info = group_terminate, group_info
             min_rew = torch.minimum(min_rew, rews)
         rews = min_rew
 

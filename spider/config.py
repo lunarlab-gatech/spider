@@ -75,9 +75,23 @@ class Config:
         1  # number of domain randomization groups, used for domain randomization
     )
     pair_margin_range: tuple[float, float] = (-0.005, 0.005)
-    xy_offset_range: tuple[float, float] = (-0.005, 0.005)
+    xy_offset_range: tuple[float, float] = (0.0, 0.0)  # run_mjwp.py only
     perturb_force: float = 0.0
     perturb_torque: float = 0.0
+    # Robust planning (run_mjwp_fast only): each [dx (m), dy (m), dyaw (rad)]
+    # adds a rollout group that moves the object by that offset at the window
+    # start. A sample scores the worst of its groups, and the kept plan comes
+    # from the first group, which does not move the object.
+    object_offsets: list = field(default_factory=list)
+    # The collision geoms of these bodies grow by inflate_distance (m) in the
+    # MJWP model only; the scene files keep the measured geometry.
+    inflate_bodies: list = field(default_factory=list)
+    inflate_distance: float = 0.0
+    # Cost on controls of these actuators that come closer than
+    # ctrl_limit_margin to their ctrlrange: ctrl_limit_rew_scale per unit.
+    ctrl_limit_actuators: list = field(default_factory=list)
+    ctrl_limit_margin: float = 0.0
+    ctrl_limit_rew_scale: float = 0.0
     contact_guidance: bool = False
     object_pos_actuator_names: list[str] = field(
         default_factory=lambda: [
@@ -178,6 +192,10 @@ class Config:
     right_pos_ctrl_ids: list = field(default_factory=list)
     left_pos_ctrl_ids: list = field(default_factory=list)
     contact_len: int = 0
+    # === CONTROL LIMIT COST (DERIVED) ===
+    ctrl_limit_ids: list = field(default_factory=list)
+    ctrl_limit_low: list = field(default_factory=list)
+    ctrl_limit_high: list = field(default_factory=list)
 
     # === AUTOMATICALLY SET PROPERTIES ===
     # Computed timesteps
@@ -248,6 +266,21 @@ def load_config_yaml(path: str) -> dict:
         raise ValueError(f"Config at {abs_path} did not resolve to a mapping.")
     cfg_dict.pop("hydra", None)
     return cfg_dict
+
+
+def resolve_ctrl_limits(config: Config, model: mujoco.MjModel) -> None:
+    """Fill ctrl_limit_ids, _low and _high from ctrl_limit_actuators."""
+    ids = []
+    for name in config.ctrl_limit_actuators:
+        aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        if aid < 0:
+            raise ValueError(f"ctrl_limit_actuators: no actuator {name!r} in {config.model_path}")
+        if not model.actuator_ctrllimited[aid]:
+            raise ValueError(f"ctrl_limit_actuators: actuator {name!r} has no ctrlrange")
+        ids.append(int(aid))
+    config.ctrl_limit_ids = ids
+    config.ctrl_limit_low = model.actuator_ctrlrange[ids, 0].tolist()
+    config.ctrl_limit_high = model.actuator_ctrlrange[ids, 1].tolist()
 
 
 def filter_config_fields(config_dict: dict) -> dict:
@@ -465,6 +498,10 @@ def process_config(config: Config):
         config.nv = model.nv
         config.nu = model.nu
         config.npair = model.npair
+        resolve_ctrl_limits(config, model)
+        for offset in config.object_offsets:
+            if len(offset) != 3:
+                raise ValueError(f"object_offsets: each entry is [dx, dy, dyaw], got {offset}")
         if config.contact_guidance:
             if config.object_action_dims <= 0:
                 config.object_action_dims = (
