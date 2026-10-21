@@ -99,42 +99,107 @@ def test_inflate_hull_moves_every_face_out_by_the_distance():
     assert growth.min() >= 0.98 * 0.01 and growth.max() <= 0.01 + 1e-12
 
 
+def test_inflated_model_grows_only_paired_meshes_of_the_body(tmp_path):
+    """_inflated_model grows the paired mesh of a body by the distance, once, at its scale."""
+    # Covers: a wrong meshdir, a scale applied twice or not at all, an unpaired geom grown, a shared mesh or a moving body grown silently
+    # Owner: mjwp._inflated_model (CPU, one small scene)
+    import pytest
+
+    from spider.config import Config
+    from spider.simulators.mjwp import _inflated_model
+
+    (tmp_path / "assets").mkdir()
+    corners = [(x, y, z) for x in (0, 1) for y in (0, 1) for z in (0, 1)]
+    faces = [(1, 3, 4, 2), (5, 6, 8, 7), (1, 2, 6, 5), (3, 7, 8, 4), (1, 5, 7, 3), (2, 4, 8, 6)]
+    (tmp_path / "assets" / "box.obj").write_text(
+        "".join(f"v {x} {y} {z}\n" for x, y, z in corners)
+        + "".join("f " + " ".join(map(str, f)) + "\n" for f in faces)
+    )
+    scene = """
+<mujoco>
+  <compiler meshdir="assets"/>
+  <asset>{meshes}</asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="1 1 0.1"/>
+    <body name="funnel">{geoms}</body>
+  </worldbody>
+  <contact><pair geom1="paired" geom2="floor"/></contact>
+</mujoco>
+"""
+    meshes = '<mesh name="a" file="box.obj" scale="0.02 0.02 0.02"/>'
+    meshes += '<mesh name="b" file="box.obj" scale="0.02 0.02 0.02"/>'
+    geoms = '<geom name="paired" type="mesh" mesh="a"/><geom name="free" type="mesh" mesh="b"/>'
+    path = tmp_path / "scene.xml"
+    path.write_text(scene.format(meshes=meshes, geoms=geoms))
+    config = Config(model_path=str(path), inflate_bodies=["funnel"], inflate_distance=0.003)
+
+    model = _inflated_model(config)
+
+    def extent(name):
+        mesh = model.mesh(name)
+        vert = model.mesh_vert[mesh.vertadr[0] : mesh.vertadr[0] + mesh.vertnum[0]]
+        return vert.max(0) - vert.min(0)
+
+    np.testing.assert_allclose(extent("a"), 0.02 + 2 * 0.003, atol=2 * 0.02 * 0.003)
+    np.testing.assert_allclose(extent("b"), 0.02, atol=1e-9)
+
+    path.write_text(scene.format(meshes=meshes, geoms=geoms + '<geom type="mesh" mesh="a"/>'))
+    with pytest.raises(ValueError, match="used by 2 geoms"):
+        _inflated_model(config)
+
+    path.write_text(scene.format(meshes=meshes, geoms='<freejoint/>' + geoms))
+    with pytest.raises(ValueError, match="has joints"):
+        _inflated_model(config)
+
+
+def test_robust_plan_settings_reject_partial_values():
+    """check_robust_plan rejects inflate_* and ctrl_limit_* settings that would do nothing."""
+    # Covers: a distance without bodies, bodies without a distance, actuators with a zero cost
+    # Owner: config.check_robust_plan (pure)
+    import pytest
+
+    from spider.config import Config, check_robust_plan
+
+    check_robust_plan(Config())
+    check_robust_plan(Config(inflate_bodies=["b"], inflate_distance=0.003,
+                             ctrl_limit_actuators=["a"], ctrl_limit_margin=0.1, ctrl_limit_rew_scale=0.1))
+    for bad in (
+        {"inflate_distance": 0.003},
+        {"inflate_bodies": ["b"]},
+        {"ctrl_limit_actuators": ["a"], "ctrl_limit_margin": 0.1},
+        {"ctrl_limit_margin": 0.1, "ctrl_limit_rew_scale": 0.1},
+    ):
+        with pytest.raises(ValueError, match="set "):
+            check_robust_plan(Config(**bad))
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "MJWP needs CUDA")
 class RobustPlanTest(unittest.TestCase):
     """The control limit cost on MJWP worlds."""
 
-    def _env(self, ctrlrange=""):
-        """Two MJWP worlds of _SCENE, with an optional ctrlrange on the actuator."""
-        from spider.config import Config
+    def test_ctrl_limit_cost_charges_the_distance_inside_the_margin(self):
+        """get_reward charges controls closer than the margin to ctrlrange."""
+        # Covers: a control limit cost with the wrong sign, on clamped instead of sampled controls, or outside the margin
+        # Owner: config.resolve_ctrl_limits and mjwp.get_reward (GPU, one small model)
+        from spider.config import Config, resolve_ctrl_limits
         from spider.simulators import mjwp
 
-        scene = _SCENE.replace('kp="10"/>', f'kp="10" {ctrlrange}/>')
+        scene = _SCENE.replace('kp="10"/>', 'kp="10" name="act" ctrlrange="-0.1 0.1"/>')
         with tempfile.NamedTemporaryFile("w", suffix=".xml") as f:
             f.write(scene)
             f.flush()
-            config = Config(model_path=f.name, num_samples=2, device="cuda:0", viewer="")
+            config = Config(model_path=f.name, num_samples=2, device="cuda:0", viewer="",
+                            ctrl_limit_actuators=["act"], ctrl_limit_margin=0.05, ctrl_limit_rew_scale=2.0)
             config.embodiment_type = "right"
             config.nq, config.nv, config.nu, config.nq_obj = 8, 7, 1, 7
             qpos = torch.zeros(2, 8, device="cuda:0")
             qpos[:, 3], qpos[:, 4] = 0.019, 1.0
             zeros = torch.zeros(2, 7, device="cuda:0")
             env = mjwp.setup_env(config, (qpos, zeros, zeros[:, :1], None, None))
-            if ctrlrange:
-                config.ctrl_limit_ids = [0]
-                config.ctrl_limit_low, config.ctrl_limit_high = [-0.1], [0.1]
-        return config, env, mjwp
-
-    def test_ctrl_limit_cost_charges_the_distance_inside_the_margin(self):
-        """get_reward charges controls closer than the margin to ctrlrange."""
-        # Covers: a control limit cost with the wrong sign, on clamped instead of sampled controls, or outside the margin
-        # Owner: mjwp.get_reward (GPU, one small model)
-        import warp as wp
-
-        config, env, mjwp = self._env('ctrlrange="-0.1 0.1"')
-        config.ctrl_limit_margin, config.ctrl_limit_rew_scale = 0.05, 2.0
+        resolve_ctrl_limits(config, env.model_cpu)
         ref = (torch.zeros(8, device="cuda:0"), torch.zeros(7, device="cuda:0"), None, None, None)
         # Room to the limit: 0.1 (none charged), 0.02 (0.03 short), -0.1 past it (0.15 short).
         for ctrl, cost in ((0.0, 0.0), (0.08, 0.06), (0.2, 0.3)):
-            wp.to_torch(env.data_wp.ctrl)[:] = ctrl
+            mjwp.step_env(config, env, torch.full((2, 1), ctrl, device="cuda:0"))
             _, info = mjwp.get_reward(config, env, ref)
             np.testing.assert_allclose(info["ctrl_limit_rew"].cpu().numpy(), -cost, atol=1e-6)

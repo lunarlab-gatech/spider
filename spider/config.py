@@ -78,12 +78,17 @@ class Config:
     xy_offset_range: tuple[float, float] = (-0.005, 0.005)
     perturb_force: float = 0.0
     perturb_torque: float = 0.0
-    # The collision geoms of these bodies grow by inflate_distance (m) in the
-    # MJWP model only; the scene files keep the measured geometry.
+    # The paired collision meshes of these bodies grow by inflate_distance (m)
+    # in the MJWP model only; the scene files keep the measured geometry. Mesh
+    # inflation, not pair margin: MuJoCo Warp 3.16 does not support a nonzero
+    # margin on the multiccd pairs these meshes form. Generated scenes set object
+    # mass from the collision geoms, so an inflated free body also gets heavier.
+    # Set both or neither.
     inflate_bodies: list = field(default_factory=list)
     inflate_distance: float = 0.0
     # Cost on controls of these actuators that come closer than
     # ctrl_limit_margin to their ctrlrange: ctrl_limit_rew_scale per unit.
+    # Set all three (margin and scale positive) or none.
     ctrl_limit_actuators: list = field(default_factory=list)
     ctrl_limit_margin: float = 0.0
     ctrl_limit_rew_scale: float = 0.0
@@ -261,6 +266,24 @@ def load_config_yaml(path: str) -> dict:
         raise ValueError(f"Config at {abs_path} did not resolve to a mapping.")
     cfg_dict.pop("hydra", None)
     return cfg_dict
+
+
+def check_robust_plan(config: Config) -> None:
+    """Reject inflate_* and ctrl_limit_* settings that would do nothing."""
+    if config.simulator != "mjwp" and (config.inflate_bodies or config.ctrl_limit_actuators):
+        raise ValueError(f"inflate_bodies and ctrl_limit_actuators need simulator mjwp, got {config.simulator}")
+    if bool(config.inflate_bodies) != (config.inflate_distance > 0):
+        raise ValueError(
+            f"inflate_bodies={list(config.inflate_bodies)} and "
+            f"inflate_distance={config.inflate_distance}: set both or neither"
+        )
+    on = (config.ctrl_limit_margin > 0, config.ctrl_limit_rew_scale > 0)
+    if bool(config.ctrl_limit_actuators) != all(on) or any(on) != all(on):
+        raise ValueError(
+            f"ctrl_limit_actuators={list(config.ctrl_limit_actuators)}, "
+            f"ctrl_limit_margin={config.ctrl_limit_margin} and "
+            f"ctrl_limit_rew_scale={config.ctrl_limit_rew_scale}: set all three or none"
+        )
 
 
 def resolve_ctrl_limits(config: Config, model: mujoco.MjModel) -> None:
@@ -444,6 +467,7 @@ def compute_noise_schedule(config: Config) -> Config:
 
 def process_config(config: Config):
     """Process the configuration to fill in the missing fields."""
+    check_robust_plan(config)
     config = compute_steps(config)
     trace_steps_tmp = int(np.round(config.trace_dt / config.sim_dt))
     assert np.isclose(
