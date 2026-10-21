@@ -75,14 +75,9 @@ class Config:
         1  # number of domain randomization groups, used for domain randomization
     )
     pair_margin_range: tuple[float, float] = (-0.005, 0.005)
-    xy_offset_range: tuple[float, float] = (0.0, 0.0)  # run_mjwp.py only
+    xy_offset_range: tuple[float, float] = (-0.005, 0.005)
     perturb_force: float = 0.0
     perturb_torque: float = 0.0
-    # Robust planning (run_mjwp_fast only): each [dx (m), dy (m), dyaw (rad)]
-    # adds a rollout group that moves the object by that offset at the window
-    # start. A sample scores the worst of its groups, and the kept plan comes
-    # from the first group, which does not move the object.
-    object_offsets: list = field(default_factory=list)
     # The collision geoms of these bodies grow by inflate_distance (m) in the
     # MJWP model only; the scene files keep the measured geometry.
     inflate_bodies: list = field(default_factory=list)
@@ -499,9 +494,6 @@ def process_config(config: Config):
         config.nu = model.nu
         config.npair = model.npair
         resolve_ctrl_limits(config, model)
-        for offset in config.object_offsets:
-            if len(offset) != 3:
-                raise ValueError(f"object_offsets: each entry is [dx, dy, dyaw], got {offset}")
         if config.contact_guidance:
             if config.object_action_dims <= 0:
                 config.object_action_dims = (

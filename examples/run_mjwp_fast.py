@@ -314,23 +314,21 @@ def main(config: Config):
 
     # setup env params (no DR-schedule dependency on contact guidance)
     if config.num_dr == 0:
+        xy_offset_list = [0.0]
         pair_margin_list = [0.0]
     else:
+        xy_offset_list = np.linspace(
+            config.xy_offset_range[0], config.xy_offset_range[1], config.num_dr
+        )
         pair_margin_list = np.linspace(
             config.pair_margin_range[0], config.pair_margin_range[1], config.num_dr
         )
-    # This script records the plan from the first group, so an xy_offset group
-    # would move the object in the kept plan; object_offsets move it in trial
-    # rollouts only. xy_offset_range stays for run_mjwp.py, which shares the config.
-    if any(float(x) != 0.0 for x in config.xy_offset_range):
-        loguru.logger.warning(
-            f"run_mjwp_fast ignores xy_offset_range={list(config.xy_offset_range)}; "
-            "use object_offsets"
-        )
     env_params_list = []
     for _ in range(config.max_num_iterations):
-        env_params = [{"pair_margin": pair_margin_list[j]} for j in range(max(config.num_dr, 1))]
-        env_params += [{"object_offset": tuple(o)} for o in config.object_offsets]
+        env_params = [
+            {"xy_offset": xy_offset_list[j], "pair_margin": pair_margin_list[j]}
+            for j in range(config.num_dr)
+        ]
         env_params_list.append(env_params)
     config.env_params_list = env_params_list
     _save_config_yaml(config)

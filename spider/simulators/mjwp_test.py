@@ -99,43 +99,9 @@ def test_inflate_hull_moves_every_face_out_by_the_distance():
     assert growth.min() >= 0.98 * 0.01 and growth.max() <= 0.01 + 1e-12
 
 
-def test_optimize_once_keeps_the_first_group_and_scores_the_worst():
-    """optimize_once scores the worst group and records only the first."""
-    # Covers: an object_offsets group reaching the kept plan (recorded states, snapshot) or a score other than the worst group
-    # Owner: sampling_fast.optimize_once with a stub rollout (CPU)
-    from unittest import mock
-
-    from spider.config import Config
-    from spider.optimizers import sampling_fast
-
-    config = Config(num_samples=3, device="cpu", viewer="", use_torch_compile=False)
-    group_rews = [torch.tensor([1.0, 5.0, 3.0]), torch.tensor([2.0, 0.0, 2.5])]
-    recorded = []
-
-    def rollout(config, env, ctrls, ref_slice, env_param, record_states=False):
-        group = env_param["group"]
-        recorded.append(record_states)
-        info = {"trace": torch.zeros(3, 1, 1, 3)}
-        if record_states:
-            info["recorded_qpos"] = 10.0 * group + torch.arange(3.0)[:, None, None]
-            info["recorded_qvel"] = info["recorded_qpos"]
-            info["state_snapshot"] = f"group {group}"
-        return ctrls, group_rews[group], torch.zeros(3, dtype=torch.bool), info
-
-    optimize_once = sampling_fast.make_optimize_once_fn_fast(rollout)
-    with mock.patch.object(sampling_fast, "sample_ctrls", lambda c, ctrls, p: ctrls.repeat(3, 1, 1)):
-        _, _, info = optimize_once(
-            config, None, torch.zeros(2, 1), (), [{"group": 0}, {"group": 1}], None, select_best=True
-        )
-    # Worst per sample: [1, 0, 2.5], so sample 2 wins, though group 0 alone picks sample 1.
-    assert info["best_idx"] == 2
-    assert recorded == [True, False]
-    assert info["recorded_qpos"].item() == 2.0 and info["state_snapshot"] == "group 0"
-
-
 @unittest.skipUnless(torch.cuda.is_available(), "MJWP needs CUDA")
 class RobustPlanTest(unittest.TestCase):
-    """Object offsets and the control limit cost on MJWP worlds."""
+    """The control limit cost on MJWP worlds."""
 
     def _env(self, ctrlrange=""):
         """Two MJWP worlds of _SCENE, with an optional ctrlrange on the actuator."""
@@ -157,26 +123,6 @@ class RobustPlanTest(unittest.TestCase):
                 config.ctrl_limit_ids = [0]
                 config.ctrl_limit_low, config.ctrl_limit_high = [-0.1], [0.1]
         return config, env, mjwp
-
-    def test_object_offset_moves_and_turns_the_free_object_only(self):
-        """object_offset moves and turns the free object about world z."""
-        # Covers: object_offsets writing the wrong qpos (hand joints, quaternion order) or a yaw about the wrong axis
-        # Owner: mjwp.load_env_params (GPU, one small model)
-        import warp as wp
-
-        config, env, mjwp = self._env()
-        qpos = wp.to_torch(env.data_wp.qpos)
-        h = np.sqrt(0.5)
-        qpos[:, 4:8] = torch.tensor([h, h, 0.0, 0.0])  # object turned 90 deg about world x
-        before = qpos.cpu().numpy()
-        mjwp.load_env_params(config, env, {"object_offset": (0.01, -0.02, np.pi / 2)})
-        after = wp.to_torch(env.data_wp.qpos).cpu().numpy()
-        want = before.copy()
-        want[:, 1] += 0.01
-        want[:, 2] -= 0.02
-        # 90 deg about world z after 90 deg about x: (h, 0, 0, h) * (h, h, 0, 0).
-        want[:, 4:8] = [0.5, 0.5, 0.5, 0.5]
-        np.testing.assert_allclose(after, want, atol=1e-6)
 
     def test_ctrl_limit_cost_charges_the_distance_inside_the_margin(self):
         """get_reward charges controls closer than the margin to ctrlrange."""

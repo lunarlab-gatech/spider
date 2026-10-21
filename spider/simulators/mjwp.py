@@ -13,7 +13,6 @@ and robust (no DR groups here; see legacy script for advanced features).
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 
@@ -25,7 +24,7 @@ import torch
 import warp as wp
 
 from spider.config import Config
-from spider.math import mul_quat, quat_sub
+from spider.math import quat_sub
 
 # Initialize Warp once per process
 try:
@@ -1086,19 +1085,6 @@ def step_env(config: Config, env: MJWPEnv, ctrl_mujoco: torch.Tensor):
         wp.capture_launch(env.graph)
 
 
-def free_object_qpos_adrs(config: Config, model: mujoco.MjModel) -> list[int]:
-    """qpos addresses of the free joints: one object per hand of the embodiment."""
-    free = mujoco.mjtJoint.mjJNT_FREE
-    adrs = [int(model.jnt_qposadr[j]) for j in range(model.njnt) if model.jnt_type[j] == free]
-    want = {"bimanual": 2, "right": 1, "left": 1}[config.embodiment_type]
-    if len(adrs) != want:
-        raise ValueError(
-            f"object offsets need {want} free object joints for {config.embodiment_type}, "
-            f"model has {len(adrs)}"
-        )
-    return adrs
-
-
 def save_env_params(config: Config, env: MJWPEnv):
     """Save the current simulation parameters."""
     # Only record which group is active; parameters are embedded in separate models
@@ -1155,22 +1141,6 @@ def load_env_params(config: Config, env: MJWPEnv, env_param: dict):
             )
 
         copy_from_torch(env.data_wp.qpos, qpos_override_th)
-
-    # move the free objects by [dx, dy, dyaw]: yaw turns each about the world z
-    # axis through its own origin
-    if "object_offset" in env_param:
-        dx, dy, dyaw = env_param["object_offset"]
-        qpos = wp.to_torch(env.data_wp.qpos)
-        yaw = torch.tensor(
-            [math.cos(dyaw / 2), 0.0, 0.0, math.sin(dyaw / 2)],
-            device=qpos.device,
-            dtype=qpos.dtype,
-        )
-        for start in free_object_qpos_adrs(config, env.model_cpu):
-            qpos[:, start : start + 2] += torch.tensor([dx, dy], device=qpos.device, dtype=qpos.dtype)
-            quat = qpos[:, start + 3 : start + 7]
-            qpos[:, start + 3 : start + 7] = mul_quat(yaw.expand_as(quat), quat)
-        copy_from_torch(env.data_wp.qpos, qpos)
 
     # update object actuator gains
     if "kp" in env_param or "kd" in env_param:
