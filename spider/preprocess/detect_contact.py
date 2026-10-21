@@ -38,8 +38,10 @@ def span_contact_points(
     contact (N, K) marks frames where fingertip k touches the object, and
     local_pos (N, K, 3) holds a per-frame point in the object frame (the
     object-surface point nearest the fingertip). A span is a run of contact
-    frames for one fingertip; its point is the mean local position over the
-    span, so a hand that lets go and grips elsewhere gets a new point. Spans that spread more than max_spread are dropped. Returns
+    frames for one fingertip; its point is the span frame's surface point
+    nearest the mean over the span, so it stays on the surface, and a hand
+    that lets go and grips elsewhere gets a new point. Spans that spread more
+    than max_spread are dropped. Returns
     the kept contact (N, K) and the per-frame span point (N, K, 3), zero
     outside kept spans.
     """
@@ -56,7 +58,8 @@ def span_contact_points(
                 )
                 continue
             kept[start:end, k] = True
-            points[start:end, k] = span.mean(axis=0)
+            # The mean of points around a curved surface lies inside the object.
+            points[start:end, k] = span[np.linalg.norm(span - span.mean(axis=0), axis=1).argmin()]
     return kept, points
 
 
