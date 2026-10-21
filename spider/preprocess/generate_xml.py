@@ -146,6 +146,12 @@ def main(
 
     # load robot xml as base scene
     mj_spec = mujoco.MjSpec.from_file(robot_xml_path)
+    # One geom per hand link mesh (robot XMLs repeat each mesh for groups 0 and
+    # 1); hand_floor_collision pairs these with the floor.
+    hand_link_meshes = {}
+    for geom in mj_spec.geoms:
+        if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
+            hand_link_meshes.setdefault((geom.parent.name, geom.meshname), geom)
 
     # Configure compiler for robust relative mesh loading
     assets_root_dir = f"{dataset_dir}/processed/{dataset_name}/assets"
@@ -687,12 +693,17 @@ def main(
                     friction=small_friction,
                     condim=3,
                 )
-    # hand <-> floor collision
+    # hand <-> floor collision, against each hand link mesh (MuJoCo collides
+    # its convex hull). The collision_hand_* primitives are sized for grasping
+    # and leave parts of the hand out: the wrist housing of the Inspire hand
+    # reaches past its palm box.
     if hand_floor_collision:
-        for hand_collision_name in hand_collision_names:
+        for (body_name, mesh_name), geom in hand_link_meshes.items():
+            if not geom.name:
+                geom.name = f"{body_name}_{mesh_name}"
             mj_spec.add_pair(
-                name=f"{hand_collision_name}_floor",
-                geomname1=hand_collision_name,
+                name=f"{geom.name}_floor",
+                geomname1=geom.name,
                 geomname2="floor",
                 solref=default_solref,
                 friction=default_friction,

@@ -498,8 +498,22 @@ def main(
             for g in geom_names("right_object_") + geom_names("left_object_") + geom_names("fixture_")
             if ik_model.geom_group[g] == 3 or "collision" in ik_model.geom(g).name
         ]
-        ik_model.geom_contype[hand_geoms + object_geoms] = 1
-        ik_model.geom_conaffinity[hand_geoms + object_geoms] = 1
+        # Scene pairs between the floor and a hand geom (generate_xml.py
+        # --hand-floor-collision) keep the reference above the floor as well.
+        floor = mujoco.mj_name2id(ik_model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        moving_objects = set(geom_names("right_object_") + geom_names("left_object_"))
+        floor_pairs = [
+            ([int(g)], [floor])
+            for p in range(ik_model.npair)
+            for g, other in (
+                (ik_model.pair_geom1[p], ik_model.pair_geom2[p]),
+                (ik_model.pair_geom2[p], ik_model.pair_geom1[p]),
+            )
+            if floor >= 0 and other == floor and g not in moving_objects
+        ]
+        floor_geoms = [g for (g,), _ in floor_pairs] + ([floor] if floor_pairs else [])
+        ik_model.geom_contype[hand_geoms + object_geoms + floor_geoms] = 1
+        ik_model.geom_conaffinity[hand_geoms + object_geoms + floor_geoms] = 1
         # Hand geoms with a scene contact pair between them (palm and fingertips,
         # the two hands) collide in MJWP, so a reference with the thumb inside the index
         # makes MJWP push the two apart with large contact forces.
@@ -512,7 +526,7 @@ def main(
         limits.append(
             mink.CollisionAvoidanceLimit(
                 ik_model,
-                [(hand_geoms, object_geoms), *hand_pairs],
+                [(hand_geoms, object_geoms), *hand_pairs, *floor_pairs],
                 minimum_distance_from_collisions=object_clearance,
                 collision_detection_distance=object_clearance + 0.02,
             )
@@ -528,10 +542,12 @@ def main(
         if object_dofs:
             constraints = [mink.DofFreezingTask(ik_model, object_dofs)]
         kept = sum(a in hand_set and b in hand_set for a, b in limits[-1].geom_id_pairs)
+        kept_floor = sum(floor in (a, b) for a, b in limits[-1].geom_id_pairs)
         loguru.logger.info(
             f"IK keeps {len(hand_geoms)} hand geoms {object_clearance} m from "
-            f"{len(object_geoms)} object and fixture geoms, and apart in {kept} of "
-            f"{len(hand_pairs)} scene hand pairs that mink's filters keep"
+            f"{len(object_geoms)} object and fixture geoms, apart in {kept} of "
+            f"{len(hand_pairs)} scene hand pairs, and above the floor in {kept_floor} of "
+            f"{len(floor_pairs)} scene hand-floor pairs that mink's filters keep"
         )
 
     extra_tasks = []
