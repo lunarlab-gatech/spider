@@ -18,9 +18,12 @@ from loop_rate_limiters import RateLimiter
 from spider import ROOT
 from spider.io import get_processed_data_dir
 
-# Half thickness of the table box. The box only needs depth for its collision;
-# 25 mm is more than a hand or object step moves in one physics step.
-TABLE_HALF_THICKNESS = 0.025
+# Half thickness of the table box. A geom deeper in the box than its half
+# thickness is pushed out through the bottom. The export lets the object go
+# 60 mm below the floor (max_object_below_floor_m), and on recording 3 a
+# tracked fingertip goes 42 mm below it inside the measured rectangle; 0.25 m
+# is several times both.
+TABLE_HALF_THICKNESS = 0.25
 
 
 def _format_float(value: float) -> str:
@@ -282,6 +285,8 @@ def main(
         # The measured table top (xr table): a box whose top is the floor
         # height, so a hand past the table edge can go below it. It keeps the
         # name "floor", so the floor pairs and the IK floor limits apply to it.
+        # The box ends at all four half extents, also on sides that xr table
+        # only bounds (the table is at least that large there).
         half_x, half_y = table["half_extents_xy"]
         yaw = float(table["yaw_rad"])
         mj_spec.worldbody.add_geom(
