@@ -18,6 +18,13 @@ from loop_rate_limiters import RateLimiter
 from spider import ROOT
 from spider.io import get_processed_data_dir
 
+# Half thickness of the table box. A geom deeper in the box than its half
+# thickness is pushed out through the bottom. The export lets the object go
+# 60 mm below the floor (max_object_below_floor_m), and on recording 3 a
+# tracked fingertip goes 42 mm below it inside the measured rectangle; 0.25 m
+# is several times both.
+TABLE_HALF_THICKNESS = 0.25
+
 
 def _format_float(value: float) -> str:
     return f"{value:.6g}"
@@ -146,6 +153,13 @@ def main(
 
     # load robot xml as base scene
     mj_spec = mujoco.MjSpec.from_file(robot_xml_path)
+    # One geom per hand link mesh (robot XMLs repeat each mesh for groups 0 and
+    # 1); hand_floor_collision pairs these with the floor. Collected before the
+    # scene geoms are added, so mj_spec.geoms holds only the robot geoms here.
+    hand_link_meshes = {}
+    for geom in mj_spec.geoms:
+        if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
+            hand_link_meshes.setdefault((geom.parent.name, geom.meshname), geom)
 
     # Configure compiler for robust relative mesh loading
     assets_root_dir = f"{dataset_dir}/processed/{dataset_name}/assets"
@@ -258,13 +272,31 @@ def main(
     else:
         material_name = "left_groundplane"
     floor_z = -0.001
-    mj_spec.worldbody.add_geom(
-        name="floor",
-        type=mujoco.mjtGeom.mjGEOM_PLANE,
-        size=[0, 0, 0.05],
-        pos=[0, 0, floor_z],
-        material=material_name,
-    )
+    table = task_info.get("table")
+    if table is None:
+        mj_spec.worldbody.add_geom(
+            name="floor",
+            type=mujoco.mjtGeom.mjGEOM_PLANE,
+            size=[0, 0, 0.05],
+            pos=[0, 0, floor_z],
+            material=material_name,
+        )
+    else:
+        # The measured table top (xr table): a box whose top is the floor
+        # height, so a hand past the table edge can go below it. It keeps the
+        # name "floor", so the floor pairs and the IK floor limits apply to it.
+        # The box ends at all four half extents, also on sides that xr table
+        # only bounds (the table is at least that large there).
+        half_x, half_y = table["half_extents_xy"]
+        yaw = float(table["yaw_rad"])
+        mj_spec.worldbody.add_geom(
+            name="floor",
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=[half_x, half_y, TABLE_HALF_THICKNESS],
+            pos=[*table["center_xy"], floor_z - TABLE_HALF_THICKNESS],
+            quat=[np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)],
+            material=material_name,
+        )
     right_convex_dir = task_info.get("right_object_convex_dir")
     right_convex_dir = f"{dataset_dir}/{right_convex_dir}"
     left_convex_dir = task_info.get("left_object_convex_dir")
@@ -687,12 +719,17 @@ def main(
                     friction=small_friction,
                     condim=3,
                 )
-    # hand <-> floor collision
+    # hand <-> floor collision, against each hand link mesh (MuJoCo collides
+    # its convex hull). The collision_hand_* primitives are sized for grasping
+    # and leave parts of the hand out: the wrist housing of the Inspire hand
+    # reaches past its palm box.
     if hand_floor_collision:
-        for hand_collision_name in hand_collision_names:
+        for (body_name, mesh_name), geom in hand_link_meshes.items():
+            if not geom.name:
+                geom.name = f"{body_name}_{mesh_name}"
             mj_spec.add_pair(
-                name=f"{hand_collision_name}_floor",
-                geomname1=hand_collision_name,
+                name=f"{geom.name}_floor",
+                geomname1=geom.name,
                 geomname2="floor",
                 solref=default_solref,
                 friction=default_friction,
