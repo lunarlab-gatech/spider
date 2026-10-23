@@ -18,20 +18,25 @@ a comfortable zone and squared outside it.
 
 The body estimate comes from --body, an npz with `shoulder` (N, 3) and `heading` (N, 3, 3) on
 the export clock and the scalar `arm_len_m` (the xr-to-trajectory-pipeline writes it with
-`xr-spider-body`). Row k is taken as reference frame k: IK drops up to two export frames, 40 ms,
-well inside the 1 s smoothing of the estimate. The spread is drawn here, seeded.
+`xr body`). IK drops and shifts export frames (ik_fast slices, filters and drops its first
+row), so --keypoints, the export trajectory_keypoints.npz, finds the export frame of reference
+row 0 by matching the object positions, which IK copies unchanged; a mismatch (another IK
+--z-offset, say) raises. The spread is drawn here, seeded.
 
 Off by default in the pipeline (ARM_SHAPE=1). Writes trajectory_kinematic.npz in place and keeps
 the IK output as trajectory_kinematic_unshaped.npz, plus trajectory_kinematic_shape.json (costs
 before and after, largest shift, weights).
 
-usage: python spider/preprocess/shape_wrist.py --run-dir RUN --body body_estimate.npz
+usage: python spider/preprocess/shape_wrist.py --run-dir RUN --body body_estimate.npz \
+    --keypoints trajectory_keypoints.npz
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -62,7 +67,7 @@ class Weights:
     w_acc: float = 2e-3
     w_jerk: float = 2e-7
     v_comf: float = 0.5  # m/s
-    w_comf: float = 1.5  # rad/s
+    om_comf: float = 1.5  # rad/s
     w_speed: float = 10.0
     wrist_clear: float = 0.08  # m above the table, away from grips
     obj_clear: float = 0.05  # m from the object surface, away from grips
@@ -112,12 +117,12 @@ def free_mask(
 
 
 def grip_distance_s(free: np.ndarray, dt: float) -> np.ndarray:
-    """Time to the nearest pinned frame, s (inf when nothing is pinned)."""
+    """Time to the nearest pinned frame, s; needs at least one pinned frame."""
     idx = np.flatnonzero(~free)
-    if idx.size == 0:
-        return np.full(len(free), np.inf)
     k = np.arange(len(free))
-    return np.abs(k[:, None] - idx[None]).min(1) * dt
+    after = idx[np.minimum(np.searchsorted(idx, k), len(idx) - 1)]
+    before = idx[np.maximum(np.searchsorted(idx, k, side="right") - 1, 0)]
+    return np.minimum(np.abs(after - k), np.abs(k - before)) * dt
 
 
 # ------------------------------------------------------------------ torch helpers
@@ -252,11 +257,25 @@ def shape(
     iters: int = 400,
 ) -> tuple[np.ndarray, dict]:
     """Return the reshaped qpos and a cost report. Only the 6 floating-hand joints change."""
-    torch.set_default_dtype(torch.float64)
     n = len(qpos)
     free = free_mask(contact, dt, w.pin_pad_s, w.grip_min_fingers)
-    if not free.any():
-        return qpos.copy(), {"free_frames": 0}
+    if free.all() or not free.any():
+        # The grasp axis comes from the grip frames, and only free frames move.
+        raise ValueError(
+            f"{int((~free).sum())} of {n} frames grip with >= {w.grip_min_fingers} "
+            "contacts; shape_wrist needs both grip and free frames"
+        )
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        return _shape(qpos, contact, dt, body, model, w, iters, free)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+def _shape(qpos, contact, dt, body, model, w, iters, free):
+    """shape() in float64, for a mask with grip and free frames."""
+    n = len(qpos)
     gdist = torch.as_tensor(grip_distance_s(free, dt))
     ramp = torch.clamp(gdist / w.ramp_s, 0, 1)
     p_ref = torch.as_tensor(qpos[:, :3])
@@ -346,7 +365,7 @@ def shape(
         c_acc = (a**2).sum(-1).sum() + (al**2).sum(-1).sum()
         c_jerk = (j**2).sum(-1).sum()
         c_speed = hinge2(torch.linalg.norm(v, dim=-1) - w.v_comf) + hinge2(
-            torch.sqrt((om**2).sum(-1) + 1e-12) - w.w_comf
+            torch.sqrt((om**2).sum(-1) + 1e-12) - w.om_comf
         )
         # 5. clearance under the wrist (table) and from the object, ramped near grips
         c_clear = (
@@ -400,9 +419,10 @@ def shape(
     out[~free] = qpos[~free]
     step = np.abs(np.diff(out[:, 3:6], axis=0)).max()
     ref_step = np.abs(np.diff(qpos[:, 3:6], axis=0)).max()
-    if step > max(0.5, 2 * ref_step):
+    if not np.isfinite(out).all() or not step <= max(0.5, 2 * ref_step):
         raise RuntimeError(
-            f"hinge angles jump {step:.3f} rad in one frame (reference {ref_step:.3f})"
+            f"shaped hinge angles are not finite or jump {step:.3f} rad in one frame "
+            f"(reference {ref_step:.3f})"
         )
     report = {
         "free_frames": int(free.sum()),
@@ -414,6 +434,18 @@ def shape(
     return out, report
 
 
+def export_row_of_reference(ref_obj: np.ndarray, export_obj: np.ndarray) -> int:
+    """Export frame of reference row 0, from object positions IK copies unchanged."""
+    n = len(ref_obj)
+    for first in range(len(export_obj) - n + 1):
+        if np.abs(export_obj[first : first + n] - ref_obj).max() < 1e-5:
+            return first
+    raise ValueError(
+        "reference object positions match no run of export frames; "
+        "shape_wrist needs IK without an object offset"
+    )
+
+
 def main():
     """Shape trajectory_kinematic.npz in place from the command line."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -422,7 +454,12 @@ def main():
         required=True,
         help="directory with trajectory_kinematic.npz; scene.xml one level up",
     )
-    ap.add_argument("--body", required=True)
+    ap.add_argument("--body", required=True, help="body_estimate.npz from xr body")
+    ap.add_argument(
+        "--keypoints",
+        required=True,
+        help="export trajectory_keypoints.npz, to place reference rows on the export clock",
+    )
     ap.add_argument(
         "--weights", default=None, help="JSON object of Weights fields to override"
     )
@@ -447,15 +484,20 @@ def main():
             f"shape_wrist needs the right hand's 6 floating joints first and the right object's "
             f"free joint last in qpos; {run.parent / 'scene.xml'} differs"
         )
-    body = dict(np.load(args.body))
+    if "contact" not in d:
+        raise ValueError(f"{src} has no contact array; run contact detection before IK")
     n = len(d["qpos"])
-    if len(body["shoulder"]) < n:
+    first = export_row_of_reference(
+        d["qpos"][:, -7:-4], np.load(args.keypoints)["qpos_obj_right"][:, :3]
+    )
+    body = dict(np.load(args.body))
+    if len(body["shoulder"]) < first + n:
         raise ValueError(
-            f"body estimate has {len(body['shoulder'])} frames, the reference {n}"
+            f"body estimate has {len(body['shoulder'])} frames, the reference needs {first + n}"
         )
     body = {
-        "shoulder": body["shoulder"][:n],
-        "heading": body["heading"][:n],
+        "shoulder": body["shoulder"][first : first + n],
+        "heading": body["heading"][first : first + n],
         "arm_len_m": body["arm_len_m"],
     }
     w = Weights(**(json.loads(args.weights) if args.weights else {}))
@@ -464,9 +506,16 @@ def main():
     qvel = d["qvel"].copy()
     for i in range(1, len(qpos)):
         mujoco.mj_differentiatePos(model, qvel[i], dt, qpos[i - 1], qpos[i])
+    # Row 0 is a backward difference from a frame IK dropped; if the shaping moved
+    # row 0, take the hand velocity of row 1, as MJWP starts from qvel[0].
+    if np.any(qpos[0, :6] != d["qpos"][0, :6]):
+        qvel[0, :6] = qvel[1, :6]
     d["qpos"], d["qvel"] = qpos, qvel
-    src.rename(keep)
-    np.savez(src, **d)
+    fd, tmp = tempfile.mkstemp(suffix=".npz", dir=run)
+    os.close(fd)
+    np.savez(tmp, **d)
+    os.link(src, keep)
+    os.replace(tmp, src)
     (run / "trajectory_kinematic_shape.json").write_text(json.dumps(report, indent=1))
     print(
         json.dumps(
