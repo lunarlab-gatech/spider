@@ -46,6 +46,9 @@ class MJWPEnv:
     # Device alias used for Warp allocations/launches (e.g., "cuda:1" or "cpu")
     device: str
     num_worlds: int
+    # Per-dof weights of the qpos tracking reward (_weight_diff_qpos), built once from
+    # the config's reward scales instead of on every step of every rollout.
+    qpos_weight: torch.Tensor
 
 
 def copy_from_torch(dst: wp.array, src: torch.Tensor) -> None:
@@ -239,6 +242,7 @@ def setup_env(config: Config, ref_data: tuple[torch.Tensor, ...]) -> MJWPEnv:
         graph=default_graph,
         device=dev,
         num_worlds=int(config.num_samples),
+        qpos_weight=_weight_diff_qpos(config),
     )
 
 
@@ -741,8 +745,7 @@ def get_reward(
     qpos_diff = _diff_qpos(
         config, qpos_sim, qpos_ref.unsqueeze(0).repeat(qpos_sim.shape[0], 1)
     )
-    qpos_weight = _weight_diff_qpos(config)
-    delta_qpos = qpos_diff * qpos_weight
+    delta_qpos = qpos_diff * env.qpos_weight
     qpos_dist = torch.norm(delta_qpos, p=2, dim=1)
     qvel_dist = torch.norm(qvel_sim - qvel_ref, p=2, dim=1)
 
@@ -1096,8 +1099,10 @@ def step_env(config: Config, env: MJWPEnv, ctrl_mujoco: torch.Tensor):
         ctrl_mujoco = ctrl_mujoco.unsqueeze(0).repeat(env.num_worlds, 1)
     # Ensure we operate on the correct CUDA context/device
     with wp.ScopedDevice(env.device):
-        # apply perturbation
-        env = apply_perturbation(config, env)
+        # apply perturbation; a zero one would only rewrite the zero xfrc_applied that
+        # setup_env and the state copies leave on the objects
+        if config.perturb_force != 0.0 or config.perturb_torque != 0.0:
+            env = apply_perturbation(config, env)
         # step control
         copy_from_torch(env.data_wp.ctrl, ctrl_mujoco.to(torch.float32))
         wp.capture_launch(env.graph)

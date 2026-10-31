@@ -284,11 +284,14 @@ def make_rollout_fn_fast(  # noqa: D103
             )
             cum_rew += rew
 
-            trace = get_trace(config, env)
-            trace_list.append(trace)
+            # Only a viewer reads the traces (trace_sample).
+            if config.show_viewer:
+                trace_list.append(get_trace(config, env))
             info_list.append(info)
 
-            terminate = get_terminate(config, env, ref)
+            # The caller reads the last step's flags; earlier steps only resample.
+            if config.terminate_resample or t == n_horizon - 1:
+                terminate = get_terminate(config, env, ref)
             if (
                 config.terminate_resample
                 and t < n_horizon - 1
@@ -325,11 +328,9 @@ def make_rollout_fn_fast(  # noqa: D103
         env = load_state(env, init_state)
         env = load_env_params(config, env, init_env_param)
 
-        trace_list = torch.stack(trace_list, dim=1)
-        info = {
-            "trace": trace_list,
-            **mean_info,
-        }
+        info = dict(mean_info)
+        if trace_list:
+            info["trace"] = torch.stack(trace_list, dim=1)
 
         if record_states:
             info["recorded_qpos"] = recorded_qpos
