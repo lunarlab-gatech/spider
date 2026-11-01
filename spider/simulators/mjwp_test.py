@@ -61,6 +61,7 @@ class StateCopyTest(unittest.TestCase):
             f.flush()
             config = Config(model_path=f.name, num_samples=3, device="cuda:0", viewer="")
             config.embodiment_type = "right"
+            config.nq, config.nv, config.nu, config.nq_obj = 8, 7, 1, 7
             qpos = torch.zeros(2, 8, device="cuda:0")
             qpos[:, 3], qpos[:, 4] = 0.019, 1.0
             zeros = torch.zeros(2, 7, device="cuda:0")
