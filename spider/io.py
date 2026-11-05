@@ -119,6 +119,38 @@ def load_data(
     )
 
 
+def load_side_planes(config: Config, data_path: str) -> tuple[torch.Tensor, list[int]]:
+    """Side planes for the MJWP side reward, on the time grid of load_data.
+
+    Returns a (T, K, 8) tensor that holds, per step and fingertip, the active
+    flag, the body id, and the plane point and normal in that body's frame
+    (ik_fast.SidePlanes), and the K fingertip collision geom ids. Each reference
+    frame holds for ref_steps steps (the flag and the body id do not
+    interpolate), and the end is padded as load_data pads it.
+    """
+    raw = np.load(data_path)
+    if "side_plane_active" not in raw:
+        raise ValueError(
+            f"side_rew_scale > 0 needs side planes in {data_path}: run ik_fast.py with --side-plane-bodies"
+        )
+    planes = np.concatenate(
+        [
+            raw["side_plane_active"][..., None],
+            raw["side_plane_body"][..., None],
+            raw["side_plane_point"],
+            raw["side_plane_normal"],
+        ],
+        axis=-1,
+    )
+    planes = torch.from_numpy(planes).to(config.device).to(torch.float32)
+    if config.ref_dt > config.sim_dt:
+        planes = planes.repeat_interleave(config.ref_steps, dim=0)
+    else:
+        planes = planes[:: int(config.sim_dt / config.ref_dt)]
+    pad = planes[-1:].expand(config.horizon_steps + config.ctrl_steps, -1, -1)
+    return torch.cat([planes, pad], dim=0), raw["side_plane_geom_ids"].tolist()
+
+
 def get_processed_data_dir(
     dataset_dir: str,
     dataset_name: str,

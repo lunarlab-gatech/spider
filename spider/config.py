@@ -165,6 +165,11 @@ class Config:
     # fingertip collision geoms (capsule or sphere) when set; from task_info.json.
     contact_site_ids: list = field(default_factory=list)
     contact_geom_ids: list = field(default_factory=list)
+    # Side reward: each fingertip collision geom pays this per metre that it is
+    # past its IK side plane (ik_fast side_plane_bodies), so the plan keeps the
+    # fingers on the human side of the part. The planes and geom ids come from
+    # trajectory_kinematic.npz (io.load_side_planes). 0.0 is off.
+    side_rew_scale: float = 0.0
 
     # === VISUALIZATION CONFIGURATION ===
     show_viewer: bool = True
@@ -196,6 +201,8 @@ class Config:
     ctrl_limit_ids: list = field(default_factory=list)
     ctrl_limit_low: list = field(default_factory=list)
     ctrl_limit_high: list = field(default_factory=list)
+    # === SIDE REWARD (DERIVED) ===
+    side_plane_geom_ids: list = field(default_factory=list)
 
     # === AUTOMATICALLY SET PROPERTIES ===
     # Computed timesteps

@@ -41,7 +41,7 @@ from spider.config import (
     process_config,
 )
 from spider.interp import get_slice
-from spider.io import load_data
+from spider.io import load_data, load_side_planes
 from spider.optimizers.sampling_fast import (
     _restore_best_state_to_env,
     make_optimize_fn_fast,
@@ -261,6 +261,13 @@ def main(config: Config):
     )
 
     ref_data = (qpos_ref, qvel_ref, ctrl_ref, contact, contact_pos)
+    if config.side_rew_scale > 0.0:
+        side_planes, config.side_plane_geom_ids = load_side_planes(config, config.data_path)
+        if side_planes.shape[0] != qpos_ref.shape[0]:
+            raise ValueError(
+                f"side planes have {side_planes.shape[0]} steps, the reference {qpos_ref.shape[0]}"
+            )
+        ref_data = (*ref_data, side_planes)
     config.max_sim_steps = (
         config.max_sim_steps
         if config.max_sim_steps > 0

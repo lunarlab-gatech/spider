@@ -15,7 +15,8 @@ inside or that the moving object stepped into, so the reference does not ask
 MJWP to hold fingers inside an object, inside each other, or under the floor.
 With side_plane_bodies set, SidePlanes keeps each fingertip on the side of a
 part of those bodies that the human fingertip is on, which the collision limit
-alone does not decide.
+alone does not decide, and the output carries the per-frame planes for the
+MJWP side reward (side_rew_scale).
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.
@@ -220,6 +221,10 @@ class SidePlanes:
     and a PenetrationTask on `pairs` keep the robot fingertip geom on the human
     side of it, as the object limit does for an object geom. The planes of the
     other fingertips are parked 1 km below the scene.
+
+    update also keeps each plane in the frame of the body that owns its side
+    geom, and reference_planes gives them to ik_fast for the MJWP side reward
+    (mjwp.side_plane_distance), which moves them with the simulated object.
     """
 
     def __init__(self, model, tip_geoms, side_geoms, distance=SIDE_PLANE_DISTANCE):
@@ -235,6 +240,9 @@ class SidePlanes:
         self.plane_mocap = [mocap(g) for g in self.planes]
         self.pairs = [([t], [p]) for t, p in zip(tip_geoms, self.planes, strict=True)]
         self._fromto = np.zeros(6)
+        self.active = np.zeros(len(k), dtype=bool)
+        self.body = np.zeros(len(k), dtype=int)
+        self.point, self.normal = np.zeros((len(k), 3)), np.zeros((len(k), 3))
 
     @staticmethod
     def add_geoms(spec, count):
@@ -259,21 +267,46 @@ class SidePlanes:
         data.mocap_pos[self.probe_mocap] = human_tips
         mujoco.mj_kinematics(model, data)
         for k, probe in enumerate(self.probes):
-            nearest, point = self.distance, None
+            nearest, point, geom = self.distance, None, None
             for g in self.side_geoms:
                 dist = mujoco.mj_geomDistance(model, data, probe, g, self.distance, self._fromto)
                 if dist <= 0.0:  # human fingertip inside the part: no side
                     point = None
                     break
                 if dist < nearest:
-                    nearest, point = dist, self._fromto[3:].copy()
+                    nearest, point, geom = dist, self._fromto[3:].copy(), g
             mocap = self.plane_mocap[k]
+            self.active[k] = point is not None
             if point is None:
                 data.mocap_pos[mocap] = _PARKED
                 data.mocap_quat[mocap] = [1.0, 0.0, 0.0, 0.0]
+                self.body[k], self.point[k], self.normal[k] = 0, 0.0, 0.0
                 continue
             data.mocap_pos[mocap] = point
             mujoco.mju_quatZ2Vec(data.mocap_quat[mocap], human_tips[k] - point)  # normalizes
+            normal = (human_tips[k] - point) / np.linalg.norm(human_tips[k] - point)
+            body = model.geom_bodyid[geom]
+            rotation = data.xmat[body].reshape(3, 3)
+            self.body[k] = body
+            self.point[k] = rotation.T @ (point - data.xpos[body])
+            self.normal[k] = rotation.T @ normal
+
+    def reference_planes(self, model, data):
+        """The planes of this frame for the MJWP side reward, once IK has solved the frame.
+
+        Returns `active` (K,), `body` (K,) body id, and `point` and `normal`
+        (K, 3) in that body's frame, zero where the plane is parked. A plane
+        that the IK fingertip is past, such as a finger beside the edge of the
+        glass when the plane appears or a finger pressed into the glass, moves
+        back to the fingertip, so the reward charges a plan only for going
+        further past the plane than the IK reference does.
+        """
+        mujoco.mj_kinematics(model, data)
+        point = self.point.copy()
+        for k, ((tip,), (plane,)) in enumerate(self.pairs):
+            if self.active[k]:  # distmax 0: the signed distance if the geom is past the plane, else 0
+                point[k] += mujoco.mj_geomDistance(model, data, tip, plane, 0.0, self._fromto) * self.normal[k]
+        return self.active.copy(), self.body.copy(), point, self.normal.copy()
 
 
 class ContactPointTask(mink.Task):
@@ -780,6 +813,7 @@ def main(
     # -- Main IK loop --
     loguru.logger.info(f"Running IK for {num_frames} frames...")
     qpos_list = []
+    side_frames = []  # per frame: SidePlanes.reference_planes
     images = []
 
     if save_video:
@@ -813,6 +847,8 @@ def main(
                 set_object_qpos(t)
 
             qpos_list.append(configuration.q.copy())
+            if side_planes is not None:
+                side_frames.append(side_planes.reference_planes(ik_model, data))
 
             if save_video:
                 sync_view()
@@ -882,6 +918,23 @@ def main(
     qpos_list = qpos_list[1:]
     assert qpos_list.shape[0] == qvel_list.shape[0]
 
+    # Side planes of the frame at the centre of each output frame's averaging
+    # window, with body and fingertip geom ids of the scene model that MJWP loads.
+    side_out = {}
+    if side_planes is not None:
+        start = 1 + (average_frame_size - 1) // 2
+        active, body, point, normal = (
+            np.stack(column)[start : start + len(qpos_list)] for column in zip(*side_frames, strict=True)
+        )
+        scene_body = {b: model.body(ik_model.body(b).name).id for b in np.unique(body)}
+        side_out = {
+            "side_plane_active": active,
+            "side_plane_body": np.vectorize(scene_body.get, otypes=[int])(body),
+            "side_plane_point": point,
+            "side_plane_normal": normal,
+            "side_plane_geom_ids": np.array([fingertip_geom(model, s) for s in finger_sites]),
+        }
+
     # -- Forward rollout for validation --
     mj_data_rollout = mujoco.MjData(model)
     n_rollout_substeps = max(1, int(round(ref_dt / sim_dt)))
@@ -915,7 +968,7 @@ def main(
 
     out_npz = f"{file_dir}/trajectory_kinematic.npz"
     np.savez(
-        out_npz, qpos=qpos_list, qvel=qvel_list, frequency=1 / ref_dt, **contact_out
+        out_npz, qpos=qpos_list, qvel=qvel_list, frequency=1 / ref_dt, **contact_out, **side_out
     )
     loguru.logger.info(f"Saved {out_npz}")
 
