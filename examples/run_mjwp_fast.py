@@ -261,8 +261,10 @@ def main(config: Config):
     )
 
     ref_data = (qpos_ref, qvel_ref, ctrl_ref, contact, contact_pos)
-    if config.side_rew_scale > 0.0:
-        side_planes, config.side_plane_geom_ids = load_side_planes(config, config.data_path)
+    # When IK saved side planes (ik_fast.py --side-plane-bodies), get_reward adds the side reward.
+    side = load_side_planes(config, config.data_path)
+    if side is not None:
+        side_planes, config.side_plane_geom_ids = side
         if side_planes.shape[0] != qpos_ref.shape[0]:
             raise ValueError(
                 f"side planes have {side_planes.shape[0]} steps, the reference {qpos_ref.shape[0]}"

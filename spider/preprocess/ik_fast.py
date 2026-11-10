@@ -15,8 +15,8 @@ inside or that the moving object stepped into, so the reference does not ask
 MJWP to hold fingers inside an object, inside each other, or under the floor.
 With side_plane_bodies set, SidePlanes keeps each fingertip on the side of a
 part of those bodies that the human fingertip is on, which the collision limit
-alone does not decide, and the output carries the per-frame planes for the
-MJWP side reward (side_rew_scale).
+alone does not decide, and the output carries the per-frame planes, which
+make run_mjwp_fast.py add the MJWP side reward (mjwp.get_reward).
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.

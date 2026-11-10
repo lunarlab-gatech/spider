@@ -119,20 +119,19 @@ def load_data(
     )
 
 
-def load_side_planes(config: Config, data_path: str) -> tuple[torch.Tensor, list[int]]:
+def load_side_planes(config: Config, data_path: str) -> tuple[torch.Tensor, list[int]] | None:
     """Side planes for the MJWP side reward, on the time grid of load_data.
 
     Returns a (T, K, 8) tensor that holds, per step and fingertip, the active
     flag, the body id, and the plane point and normal in that body's frame
     (ik_fast.SidePlanes), and the K fingertip collision geom ids. Each reference
     frame holds for ref_steps steps (the flag and the body id do not
-    interpolate), and the end is padded as load_data pads it.
+    interpolate), and the end is padded as load_data pads it. Returns None
+    when IK saved no planes (ik_fast.py without --side-plane-bodies).
     """
     raw = np.load(data_path)
     if "side_plane_active" not in raw:
-        raise ValueError(
-            f"side_rew_scale > 0 needs side planes in {data_path}: run ik_fast.py with --side-plane-bodies"
-        )
+        return None
     planes = np.concatenate(
         [
             raw["side_plane_active"][..., None],
