@@ -173,8 +173,7 @@ def test_side_plane_distance_rebuilds_the_ik_side_plane_on_the_moving_body():
         arrays = [torch.from_numpy(a.reshape(1, *a.shape)) for a in (data.geom_xpos, data.geom_xmat, data.xpos, data.xmat)]
         return side_plane_distance(model, [tip], *arrays, planes).item()
 
-    def solved(local_pos, local_quat):
-        """reference_planes of a frame that IK solved with the tip at this pose, packed as io.load_side_planes."""
+    def solved(local_pos, local_quat):  # reference_planes of a frame that IK solved with the tip at this pose
         place(turned, np.array(local_pos), local_quat)
         active, body, point, normal = sides.reference_planes(model, data)
         return torch.tensor([[active[0], body[0], *point[0], *normal[0]]], dtype=torch.float64)
@@ -185,7 +184,8 @@ def test_side_plane_distance_rebuilds_the_ik_side_plane_on_the_moving_body():
     # The human fingertip is 10 mm under the plate near its edge: the plane is on the plate bottom, facing down.
     place(turned, np.zeros(3), upright)
     sides = SidePlanes(model, [tip], [model.geom("plate").id])
-    sides.update(model, data, (turned[:3] + data.xmat[stage].reshape(3, 3) @ [0.04, 0.0, -0.012])[None])
+    sides.plan(model, data, (turned[:3] + data.xmat[stage].reshape(3, 3) @ [0.04, 0.0, -0.012])[None, None], lambda t: None)
+    sides.place(model, data, 0)
     planes = solved([0.02, 0.01, -0.03], upright)  # IK left the tip under the plate
     cases = {  # tip pose in the stage frame; distance to the IK plane geom by MuJoCo's capsule-plane collision
         "under, upright": ([0.02, 0.01, -0.03], upright),

@@ -14,9 +14,10 @@ limit stops the hand moving in, and PenetrationTask pushes out geoms that start
 inside or that the moving object stepped into, so the reference does not ask
 MJWP to hold fingers inside an object, inside each other, or under the floor.
 With side_plane_bodies set, SidePlanes keeps each fingertip on the side of a
-part of those bodies that the human fingertip is on, which the collision limit
-alone does not decide, and the output carries the per-frame planes, which
-make run_mjwp_fast.py add the MJWP side reward (mjwp.get_reward).
+part of those bodies that the human fingertip is on for most of each near
+span (hold_sides), which the collision limit alone does not decide, and the
+output carries the per-frame planes, which make run_mjwp_fast.py add the MJWP
+side reward (mjwp.get_reward).
 
 Input: mujoco scene xml file + hand keypoints + object trajectories.
 Output: npz file which contains qpos for key frames in xml.
@@ -24,8 +25,12 @@ Output: npz file which contains qpos for key frames in xml.
 Strategy:
 1. Frame 0: set wrist targets first, integrate many steps, then add finger
    tip targets and integrate more steps.
-2. Subsequent frames: solve IK with all targets, integrating sim_dt steps
-   for each ref_dt interval.
+2. Subsequent frames: solve IK with all targets in up to FRAME_STEPS steps
+   per frame. A step holds each hinge and slide joint within a largest change
+   (step_speeds) and is cut to the part of it that lowers the task cost
+   (improving_scale); the frame ends when no part down to MIN_STEP_SCALE
+   does. sim_dt is the step of the two phases of frame 0 and of the rollout
+   file.
 3. Object qpos is set directly (no retargeting).
 
 Author: Chaoyi Pan
@@ -34,6 +39,7 @@ Date: 2026-03-07
 
 import json
 import os
+from functools import partial
 from pathlib import Path
 
 import loguru
@@ -137,6 +143,55 @@ def _build_ref_skeleton(server, mano_assets_root, qpos_ref, ref_idx, embodiment_
 # 1 cm of fingertip error.
 PENETRATION_COST = 100.0
 
+# IK steps per reference frame after frame 0, and the largest change of a hinge
+# or slide joint in one of them. mink solves for a displacement, so the length
+# of a step does not follow its dt, and the collision limit is linear in the
+# step: a wrist that turns 5 to 10 deg in one step leaves a fingertip up to
+# 4.4 mm (p95) from where the limit row put it, and at most 0.5 deg leaves
+# 0.04 mm. Three wrist hinges at 0.29 deg turn the wrist at most 0.5 deg. Per
+# 20 ms frame the bounds are 11.6 deg and 40 mm; the fastest human wrist of
+# airknife recording 3 moves 8.5 deg and 27.5 mm.
+FRAME_STEPS = 40
+MAX_HINGE_STEP = np.radians(0.29)
+MAX_SLIDE_STEP = 0.001  # m
+# The shortest part of a step that the frame loop takes (improving_scale).
+MIN_STEP_SCALE = 1 / 16
+
+
+def step_speeds(model, step_dt):
+    """Joint speeds for mink.VelocityLimit that bound one IK step of step_dt.
+
+    Each hinge joint changes at most MAX_HINGE_STEP and each slide joint at
+    most MAX_SLIDE_STEP per step. Free joints, the objects, get no bound: the
+    frame loop sets their pose.
+    """
+    largest = {
+        int(mujoco.mjtJoint.mjJNT_HINGE): MAX_HINGE_STEP,
+        int(mujoco.mjtJoint.mjJNT_SLIDE): MAX_SLIDE_STEP,
+    }
+    return {
+        model.joint(j).name: largest[int(model.jnt_type[j])] / step_dt
+        for j in range(model.njnt)
+        if int(model.jnt_type[j]) in largest
+    }
+
+
+def improving_scale(cost_before, cost_at):
+    """Largest of 1, 1/2, ... MIN_STEP_SCALE of a step that lowers the cost, or 0.
+
+    cost_at(scale) is the cost after that part of the step. The IK step lowers
+    the cost of a linear model of the tasks and limits. A long step, or a
+    change of the nearest face of a collision pair, can leave the true cost
+    above the cost before the step; the solver then moves back on the next
+    step and does not settle.
+    """
+    scale = 1.0
+    while scale >= MIN_STEP_SCALE:
+        if cost_at(scale) < cost_before:
+            return scale
+        scale /= 2
+    return 0.0
+
 
 class PenetrationTask(mink.Task):
     """Soft push-out for hand geoms that end up inside an object or the floor.
@@ -207,6 +262,53 @@ SIDE_PLANE_DISTANCE = 0.04
 _PARKED = np.array([0.0, 0.0, -1e3])
 
 
+def hold_sides(near, active, body, point, normal):
+    """Hold one side of the part over each near span of one fingertip.
+
+    Per frame (T rows): `near`, the human fingertip is within the plane distance
+    of a side geom or inside one; `active`, the frame has a plane; `body`,
+    `point` and `normal` (3,), that plane in the frame of its body. A near
+    span is a run of near frames in a row whose planes are on one body. Along
+    a span, a plane frame has the side of the plane frame before it, and the
+    other side when its normal points against that one: the normal turns by
+    less than 90 deg per frame when the fingertip goes around an edge, and
+    flips when the fingertip reads through the part. The side with the most
+    frames holds for the span (the side of the first frame on a tie): its
+    frames keep their planes, and every other frame of the span, a frame of the
+    other side or one that reads inside the part, takes the plane of the
+    nearest frame of that side in time (the earlier one on a tie).
+
+    Returns active, body, point and normal with the held planes, and the
+    number of frames whose plane the hold changed.
+    """
+    active, body, point, normal = active.copy(), body.copy(), point.copy(), normal.copy()
+    spans, span, span_body = [], [], None
+    for t in range(len(near)):
+        other_body = active[t] and span_body is not None and body[t] != span_body
+        if span and (not near[t] or other_body):
+            spans.append(span)
+            span, span_body = [], None
+        if near[t]:
+            span.append(t)
+            if active[t] and span_body is None:
+                span_body = body[t]
+    if span:
+        spans.append(span)
+    changed = 0
+    for span in map(np.array, spans):
+        planes = span[active[span]]
+        if not len(planes):
+            continue
+        against = np.einsum("ij,ij->i", normal[planes[1:]], normal[planes[:-1]]) < 0
+        side = np.concatenate([[False], np.cumsum(against) % 2 == 1])
+        kept = planes[side == (2 * side.sum() > len(side))]
+        for t in np.setdiff1d(span, kept):
+            source = kept[np.argmin(np.abs(kept - t))]
+            active[t], body[t], point[t], normal[t] = True, body[source], point[source], normal[source]
+        changed += len(span) - len(kept)
+    return active, body, point, normal, changed
+
+
 class SidePlanes:
     """Keep each fingertip on the side of a part of the side bodies that the human fingertip is on.
 
@@ -214,16 +316,20 @@ class SidePlanes:
     first, so a finger that comes past the edge of a thin part, such as the
     stage glass, on the other side from the human finger stays there. For each
     fingertip whose human fingertip is outside every side geom and within
-    `distance` of one, a plane geom on a mocap body is put on the tangent plane
-    of the nearest side geom at its nearest point, facing the human fingertip.
-    Near an edge the plane turns about the edge as the human fingertip goes
-    around it. A plane is a half-space in MuJoCo, so a CollisionAvoidanceLimit
-    and a PenetrationTask on `pairs` keep the robot fingertip geom on the human
-    side of it, as the object limit does for an object geom. The planes of the
-    other fingertips are parked 1 km below the scene.
+    `distance` of one, the plane of the frame is the tangent plane of the
+    nearest side geom at its nearest point, facing the human fingertip. Near an
+    edge the plane turns about the edge as the human fingertip goes around it.
+    A measured fingertip at a thin part reads on one side, inside the part and
+    on the other side from frame to frame, so `plan` finds the planes of every
+    frame before IK runs and hold_sides keeps one side per near span. `place`
+    puts a plane geom on a mocap body on the plane of a frame. A plane is a
+    half-space in MuJoCo, so a CollisionAvoidanceLimit and a PenetrationTask on
+    `pairs` keep the robot fingertip geom on that side of it, as the object
+    limit does for an object geom. The planes of the other fingertips are
+    parked 1 km below the scene.
 
-    update also keeps each plane in the frame of the body that owns its side
-    geom, and reference_planes gives them to ik_fast for the MJWP side reward
+    The planes are kept in the frame of the body that owns their side geom,
+    and reference_planes gives them to ik_fast for the MJWP side reward
     (mjwp.side_plane_distance), which moves them with the simulated object.
     """
 
@@ -240,6 +346,7 @@ class SidePlanes:
         self.plane_mocap = [mocap(g) for g in self.planes]
         self.pairs = [([t], [p]) for t, p in zip(tip_geoms, self.planes, strict=True)]
         self._fromto = np.zeros(6)
+        self.frames = None  # plan: active (T, K), body (T, K), point and normal (T, K, 3)
         self.active = np.zeros(len(k), dtype=bool)
         self.body = np.zeros(len(k), dtype=int)
         self.point, self.normal = np.zeros((len(k), 3)), np.zeros((len(k), 3))
@@ -259,37 +366,65 @@ class SidePlanes:
                 contype=1, conaffinity=1, group=5,
             )
 
-    def update(self, model, data, human_tips):
-        """Place the planes for the human fingertips (K, 3); object poses must be current.
+    def _frame_planes(self, model, data, human_tips):
+        """The planes of one frame for the human fingertips (K, 3); object poses must be current.
 
-        The caller runs forward kinematics afterwards to move the plane geoms.
+        Returns per fingertip `near`, `active`, `body`, `point` and `normal` as hold_sides reads them.
         """
         data.mocap_pos[self.probe_mocap] = human_tips
         mujoco.mj_kinematics(model, data)
+        count = len(self.probes)
+        near, active = np.zeros(count, dtype=bool), np.zeros(count, dtype=bool)
+        body, point, normal = np.zeros(count, dtype=int), np.zeros((count, 3)), np.zeros((count, 3))
         for k, probe in enumerate(self.probes):
-            nearest, point, geom = self.distance, None, None
+            nearest, hit, geom = self.distance, None, None
             for g in self.side_geoms:
                 dist = mujoco.mj_geomDistance(model, data, probe, g, self.distance, self._fromto)
-                if dist <= 0.0:  # human fingertip inside the part: no side
-                    point = None
+                if dist <= 0.0:  # human fingertip inside the part: no side in this frame
+                    near[k], hit = True, None
                     break
                 if dist < nearest:
-                    nearest, point, geom = dist, self._fromto[3:].copy(), g
-            mocap = self.plane_mocap[k]
-            self.active[k] = point is not None
-            if point is None:
+                    nearest, hit, geom = dist, self._fromto[3:].copy(), g
+            if hit is None:
+                continue
+            near[k] = active[k] = True
+            body[k] = model.geom_bodyid[geom]
+            rotation = data.xmat[body[k]].reshape(3, 3)
+            point[k] = rotation.T @ (hit - data.xpos[body[k]])
+            normal[k] = rotation.T @ (human_tips[k] - hit) / np.linalg.norm(human_tips[k] - hit)
+        return near, active, body, point, normal
+
+    def plan(self, model, data, human_tips, set_frame):
+        """Find the planes of every frame, with one side held per near span (hold_sides).
+
+        human_tips is (T, K, 3), and set_frame(t) puts the objects at frame t.
+        Returns the number of frames per fingertip whose plane the hold changed.
+        """
+        rows = []
+        for t, tips in enumerate(human_tips):
+            set_frame(t)
+            rows.append(self._frame_planes(model, data, tips))
+        near, *planes = (np.stack(column) for column in zip(*rows, strict=True))
+        held = [hold_sides(near[:, k], *(column[:, k] for column in planes)) for k in range(near.shape[1])]
+        *columns, changed = zip(*held, strict=True)
+        self.frames = tuple(np.stack(column, axis=1) for column in columns)
+        return list(changed)
+
+    def place(self, model, data, t):
+        """Put the plane geoms on the planes of frame t; object poses must be current.
+
+        The caller runs forward kinematics afterwards to move the plane geoms.
+        """
+        self.active, self.body, self.point, self.normal = (column[t].copy() for column in self.frames)
+        mujoco.mj_kinematics(model, data)
+        for k, mocap in enumerate(self.plane_mocap):
+            if not self.active[k]:
                 data.mocap_pos[mocap] = _PARKED
                 data.mocap_quat[mocap] = [1.0, 0.0, 0.0, 0.0]
-                self.body[k], self.point[k], self.normal[k] = 0, 0.0, 0.0
                 continue
-            data.mocap_pos[mocap] = point
-            mujoco.mju_quatZ2Vec(data.mocap_quat[mocap], human_tips[k] - point)  # normalizes
-            normal = (human_tips[k] - point) / np.linalg.norm(human_tips[k] - point)
-            body = model.geom_bodyid[geom]
-            rotation = data.xmat[body].reshape(3, 3)
-            self.body[k] = body
-            self.point[k] = rotation.T @ (point - data.xpos[body])
-            self.normal[k] = rotation.T @ normal
+            rotation = data.xmat[self.body[k]].reshape(3, 3)
+            data.mocap_pos[mocap] = data.xpos[self.body[k]] + rotation @ self.point[k]
+            mujoco.mju_quatZ2Vec(data.mocap_quat[mocap], rotation @ self.normal[k])
 
     def reference_planes(self, model, data):
         """The planes of this frame for the MJWP side reward, once IK has solved the frame.
@@ -643,7 +778,7 @@ def main(
                 collision_detection_distance=object_clearance + 0.02,
             )
         )
-        # Objects are set from the reference every substep; without this the
+        # Objects are set from the reference every frame; without this the
         # solver would move an object instead of the hand to clear a collision.
         object_dofs = [
             ik_model.jnt_dofadr[j] + k
@@ -715,10 +850,19 @@ def main(
         )
         extra_tasks.append(contact_task)
 
-    def solve(tasks):
+    # After frame 0 a step also holds every hinge and slide joint within its largest change.
+    step_dt = ref_dt / FRAME_STEPS
+    speeds = step_speeds(ik_model, step_dt)
+    frame_limits = [*limits, mink.VelocityLimit(ik_model, speeds)]
+    loguru.logger.info(
+        f"IK frame loop: up to {FRAME_STEPS} steps per frame, {len(speeds)} joints within "
+        f"{np.degrees(MAX_HINGE_STEP):.2f} deg (hinge) and {MAX_SLIDE_STEP} m (slide) per step"
+    )
+
+    def solve(tasks, dt, step_limits):
         return mink.solve_ik(
-            configuration, [*tasks, *extra_tasks], sim_dt, solver, damping=1e-5,
-            limits=limits, constraints=constraints,
+            configuration, [*tasks, *extra_tasks], dt, solver, damping=1e-5,
+            limits=step_limits, constraints=constraints,
         )
 
     # Create IK tasks
@@ -752,7 +896,20 @@ def main(
     tasks_all = [posture_task, *wrist_tasks, *finger_tasks]
 
     solver = "daqp"
-    n_substeps = max(1, int(round(ref_dt / sim_dt)))
+    trial = mink.Configuration(ik_model)
+
+    def task_cost(at):
+        """Sum over the IK tasks of |cost * error|^2 at the kinematics of `at`."""
+        return sum(float(np.sum((task.cost * task.compute_error(at)) ** 2)) for task in [*tasks_all, *extra_tasks])
+
+    def cost_after(vel, scale):
+        """task_cost after `scale` of the frame-loop step `vel`, on a copy of the configuration."""
+        # The side planes and contact probes sit on mocap bodies, which qpos does not carry.
+        trial.data.mocap_pos[:], trial.data.mocap_quat[:] = data.mocap_pos, data.mocap_quat
+        q = configuration.q.copy()
+        mujoco.mj_integratePos(ik_model, q, vel * scale, step_dt)
+        trial.update(q)
+        return task_cost(trial)
 
     # -- Helpers --
     def set_object_qpos(t):
@@ -786,9 +943,16 @@ def main(
     def set_side_planes(t):
         # After set_object_qpos(t): the planes sit on the side geoms at frame t.
         if side_planes is not None:
-            human_tips = np.array([qpos_ref[t, ref_idx[s], :3] for s in finger_sites])
-            side_planes.update(ik_model, data, human_tips)
+            side_planes.place(ik_model, data, t)
             configuration.update()
+
+    if side_planes is not None:
+        human_tips = np.stack([qpos_ref[:, ref_idx[s], :3] for s in finger_sites], axis=1)
+        changed = side_planes.plan(ik_model, data, human_tips, set_object_qpos)
+        loguru.logger.info(
+            "Side planes: frames whose plane the hold of the span side changed: "
+            + ", ".join(f"{s} {n}" for s, n in zip(finger_sites, changed, strict=True))
+        )
 
     # -- Phase 1: Initialize wrist (frame 0) --
     loguru.logger.info("Phase 1: Initializing wrist position...")
@@ -796,7 +960,7 @@ def main(
     configuration.update()
     set_wrist_targets(0)
     for _ in range(wrist_init_steps):
-        vel = solve(tasks_wrist)
+        vel = solve(tasks_wrist, sim_dt, limits)
         configuration.integrate_inplace(vel, sim_dt)
         set_object_qpos(0)
 
@@ -806,7 +970,7 @@ def main(
     set_finger_targets(0)
     set_side_planes(0)
     for _ in range(finger_init_steps):
-        vel = solve(tasks_all)
+        vel = solve(tasks_all, sim_dt, limits)
         configuration.integrate_inplace(vel, sim_dt)
         set_object_qpos(0)
 
@@ -841,9 +1005,12 @@ def main(
             configuration.update()
             set_side_planes(t)
 
-            for _ in range(n_substeps):
-                vel = solve(tasks_all)
-                configuration.integrate_inplace(vel, sim_dt)
+            for _ in range(FRAME_STEPS):
+                vel = solve(tasks_all, step_dt, frame_limits)
+                scale = improving_scale(task_cost(configuration), partial(cost_after, vel))
+                if scale == 0.0:  # no part down to MIN_STEP_SCALE lowers the cost: the frame ends
+                    break
+                configuration.integrate_inplace(vel * scale, step_dt)
                 set_object_qpos(t)
 
             qpos_list.append(configuration.q.copy())

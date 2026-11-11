@@ -681,7 +681,7 @@ def side_plane_distance(
     xmat: torch.Tensor,
     planes: torch.Tensor,
 ) -> torch.Tensor:
-    """Signed distance (W, K) of fingertip geoms from their side planes, positive on the human side.
+    """Signed distance (W, K) of fingertip geoms from their side planes, positive on the held side.
 
     planes (K, 8) is one step of io.load_side_planes: per fingertip the active
     flag, a body id, and the plane point and unit normal in that body's frame,
