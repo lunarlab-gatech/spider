@@ -25,12 +25,13 @@ Output: npz file which contains qpos for key frames in xml.
 Strategy:
 1. Frame 0: set wrist targets first, integrate many steps, then add finger
    tip targets and integrate more steps.
-2. Subsequent frames: solve IK with all targets in up to FRAME_STEPS steps
-   per frame. A step holds each hinge and slide joint within a largest change
-   (step_speeds) and is cut to the part of it that lowers the task cost
-   (improving_scale); the frame ends when no part down to MIN_STEP_SCALE
-   does. sim_dt is the step of the two phases of frame 0 and of the rollout
-   file.
+2. Subsequent frames: solve IK with all targets. With side planes, a frame
+   takes up to FRAME_STEPS steps: a step holds each hinge and slide joint
+   within a largest change (step_speeds) and is cut to the part of it that
+   lowers the task cost (improving_scale); the frame ends when no part down
+   to MIN_STEP_SCALE does. Without side planes, a frame takes ref_dt / sim_dt
+   whole steps of sim_dt. sim_dt is also the step of the two phases of
+   frame 0 and of the rollout file.
 3. Object qpos is set directly (no retargeting).
 
 Author: Chaoyi Pan
@@ -143,14 +144,18 @@ def _build_ref_skeleton(server, mano_assets_root, qpos_ref, ref_idx, embodiment_
 # 1 cm of fingertip error.
 PENETRATION_COST = 100.0
 
-# IK steps per reference frame after frame 0, and the largest change of a hinge
-# or slide joint in one of them. mink solves for a displacement, so the length
-# of a step does not follow its dt, and the collision limit is linear in the
-# step: a wrist that turns 5 to 10 deg in one step leaves a fingertip up to
-# 4.4 mm (p95) from where the limit row put it, and at most 0.5 deg leaves
-# 0.04 mm. Three wrist hinges at 0.29 deg turn the wrist at most 0.5 deg. Per
-# 20 ms frame the bounds are 11.6 deg and 40 mm; the fastest human wrist of
-# airknife recording 3 moves 8.5 deg and 27.5 mm.
+# IK steps per reference frame after frame 0 for a task with side planes, and
+# the largest change of a hinge or slide joint in one of them. mink solves for
+# a displacement, so the length of a step does not follow its dt, and the
+# collision limit is linear in the step: a wrist that turns 5 to 10 deg in one
+# step leaves a fingertip up to 4.4 mm (p95) from where the limit row put it,
+# and at most 0.5 deg leaves 0.04 mm. Three wrist hinges at 0.29 deg turn the
+# wrist at most 0.5 deg. Per 20 ms frame the bounds are 11.6 deg and 40 mm; the
+# fastest human wrist of airknife recording 3 moves 8.5 deg and 27.5 mm. A task
+# without side planes takes whole steps. Whole steps put no hand geom of 8
+# pour tasks more than 0.4 mm into the beaker, and on 139 pour layouts the
+# bounded steps changed the finger joints by 1 deg (mean, beaker in the hand)
+# while the fingertips moved 0.6 mm or less (median over the layouts).
 FRAME_STEPS = 40
 MAX_HINGE_STEP = np.radians(0.29)
 MAX_SLIDE_STEP = 0.001  # m
@@ -850,14 +855,21 @@ def main(
         )
         extra_tasks.append(contact_task)
 
-    # After frame 0 a step also holds every hinge and slide joint within its largest change.
-    step_dt = ref_dt / FRAME_STEPS
-    speeds = step_speeds(ik_model, step_dt)
-    frame_limits = [*limits, mink.VelocityLimit(ik_model, speeds)]
-    loguru.logger.info(
-        f"IK frame loop: up to {FRAME_STEPS} steps per frame, {len(speeds)} joints within "
-        f"{np.degrees(MAX_HINGE_STEP):.2f} deg (hinge) and {MAX_SLIDE_STEP} m (slide) per step"
-    )
+    # The frame loop after frame 0. With side planes a step also holds every hinge and slide joint within its
+    # largest change, and the loop takes the part of it that lowers the task cost. Without them the loop takes
+    # whole steps of sim_dt.
+    bounded = side_planes is not None
+    if bounded:
+        frame_steps, step_dt = FRAME_STEPS, ref_dt / FRAME_STEPS
+        speeds = step_speeds(ik_model, step_dt)
+        frame_limits = [*limits, mink.VelocityLimit(ik_model, speeds)]
+        loguru.logger.info(
+            f"IK frame loop: up to {FRAME_STEPS} steps per frame, {len(speeds)} joints within "
+            f"{np.degrees(MAX_HINGE_STEP):.2f} deg (hinge) and {MAX_SLIDE_STEP} m (slide) per step"
+        )
+    else:
+        frame_steps, step_dt, frame_limits = max(1, int(round(ref_dt / sim_dt))), sim_dt, limits
+        loguru.logger.info(f"IK frame loop: {frame_steps} whole steps of {sim_dt} s per frame")
 
     def solve(tasks, dt, step_limits):
         return mink.solve_ik(
@@ -1005,12 +1017,14 @@ def main(
             configuration.update()
             set_side_planes(t)
 
-            for _ in range(FRAME_STEPS):
+            for _ in range(frame_steps):
                 vel = solve(tasks_all, step_dt, frame_limits)
-                scale = improving_scale(task_cost(configuration), partial(cost_after, vel))
-                if scale == 0.0:  # no part down to MIN_STEP_SCALE lowers the cost: the frame ends
-                    break
-                configuration.integrate_inplace(vel * scale, step_dt)
+                if bounded:
+                    scale = improving_scale(task_cost(configuration), partial(cost_after, vel))
+                    if scale == 0.0:  # no part down to MIN_STEP_SCALE lowers the cost: the frame ends
+                        break
+                    vel = vel * scale
+                configuration.integrate_inplace(vel, step_dt)
                 set_object_qpos(t)
 
             qpos_list.append(configuration.q.copy())
