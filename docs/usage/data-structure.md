@@ -101,6 +101,22 @@ Kinematic retargeting result (from IK):
 }
 ```
 
+With `ik_fast.py --side-plane-bodies` the file also holds the side plane of
+each of the K fingertips per output frame
+([side planes](../workflows/workflow-mjwp.md#side-planes-for-thin-bodies)).
+`examples/run_mjwp_fast.py` reads these arrays for the side reward. Without
+the flag the file has none of them.
+
+```python
+{
+    'side_plane_active': [T, K],     # The fingertip has a plane in this frame
+    'side_plane_body': [T, K],       # Body id, in scene.xml, that owns the plane
+    'side_plane_point': [T, K, 3],   # Plane point in the frame of that body
+    'side_plane_normal': [T, K, 3],  # Unit normal in the frame of that body, toward the held side
+    'side_plane_geom_ids': [K],      # Fingertip collision geom ids in scene.xml
+}
+```
+
 #### `trajectory_mjwp.npz`
 
 Physics-optimized trajectory (from MJWP):

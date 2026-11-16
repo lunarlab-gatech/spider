@@ -84,89 +84,17 @@ class StateCopyTest(unittest.TestCase):
         np.testing.assert_allclose(xpos[2].cpu().numpy(), xpos[0].cpu().numpy())
 
 
-def test_inflate_hull_moves_every_face_out_by_the_distance():
-    """inflate_hull grows a box by the distance in every direction."""
-    # Covers: an inflation that shrinks the hull, misses a direction, or grows it by more than the distance
-    # Owner: mjwp.inflate_hull (pure geometry)
-    from spider.simulators.mjwp import inflate_hull
-
-    cube = np.array([[x, y, z] for x in (0, 1) for y in (0, 2) for z in (0, 3)], dtype=float)
-    grown = inflate_hull(cube, 0.01)
-    rng = np.random.default_rng(0)
-    directions = rng.normal(size=(1000, 3))
-    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
-    # The support function along every direction grows by 0.98 to 1.0 times the distance.
-    growth = (grown @ directions.T).max(0) - (cube @ directions.T).max(0)
-    assert growth.min() >= 0.98 * 0.01 and growth.max() <= 0.01 + 1e-12
-
-
-def test_inflated_model_grows_only_paired_meshes_of_the_body(tmp_path):
-    """_inflated_model grows the paired mesh of a body by the distance, once, at its scale."""
-    # Covers: a wrong meshdir, a scale applied twice or not at all, an unpaired geom grown, a shared mesh or a moving body grown silently
-    # Owner: mjwp._inflated_model (CPU, one small scene)
-    import pytest
-
-    from spider.config import Config
-    from spider.simulators.mjwp import _inflated_model
-
-    (tmp_path / "assets").mkdir()
-    corners = [(x, y, z) for x in (0, 1) for y in (0, 1) for z in (0, 1)]
-    faces = [(1, 3, 4, 2), (5, 6, 8, 7), (1, 2, 6, 5), (3, 7, 8, 4), (1, 5, 7, 3), (2, 4, 8, 6)]
-    (tmp_path / "assets" / "box.obj").write_text(
-        "".join(f"v {x} {y} {z}\n" for x, y, z in corners)
-        + "".join("f " + " ".join(map(str, f)) + "\n" for f in faces)
-    )
-    scene = """
-<mujoco>
-  <compiler meshdir="assets"/>
-  <asset>{meshes}</asset>
-  <worldbody>
-    <geom name="floor" type="plane" size="1 1 0.1"/>
-    <body name="funnel">{geoms}</body>
-  </worldbody>
-  <contact><pair geom1="paired" geom2="floor"/></contact>
-</mujoco>
-"""
-    meshes = '<mesh name="a" file="box.obj" scale="0.02 0.02 0.02"/>'
-    meshes += '<mesh name="b" file="box.obj" scale="0.02 0.02 0.02"/>'
-    geoms = '<geom name="paired" type="mesh" mesh="a"/><geom name="free" type="mesh" mesh="b"/>'
-    path = tmp_path / "scene.xml"
-    path.write_text(scene.format(meshes=meshes, geoms=geoms))
-    config = Config(model_path=str(path), inflate_bodies=["funnel"], inflate_distance=0.003)
-
-    model = _inflated_model(config)
-
-    def extent(name):
-        mesh = model.mesh(name)
-        vert = model.mesh_vert[mesh.vertadr[0] : mesh.vertadr[0] + mesh.vertnum[0]]
-        return vert.max(0) - vert.min(0)
-
-    np.testing.assert_allclose(extent("a"), 0.02 + 2 * 0.003, atol=2 * 0.02 * 0.003)
-    np.testing.assert_allclose(extent("b"), 0.02, atol=1e-9)
-
-    path.write_text(scene.format(meshes=meshes, geoms=geoms + '<geom type="mesh" mesh="a"/>'))
-    with pytest.raises(ValueError, match="used by 2 geoms"):
-        _inflated_model(config)
-
-    path.write_text(scene.format(meshes=meshes, geoms='<freejoint/>' + geoms))
-    with pytest.raises(ValueError, match="has joints"):
-        _inflated_model(config)
-
-
 def test_robust_plan_settings_reject_partial_values():
-    """check_robust_plan rejects inflate_* and ctrl_limit_* settings that would do nothing."""
-    # Covers: a distance without bodies, bodies without a distance, actuators with a zero cost
+    """check_robust_plan rejects ctrl_limit_* settings that would do nothing."""
+    # Covers: actuators with a zero cost, a margin and a cost without actuators
     # Owner: config.check_robust_plan (pure)
     import pytest
 
     from spider.config import Config, check_robust_plan
 
     check_robust_plan(Config())
-    check_robust_plan(Config(inflate_bodies=["b"], inflate_distance=0.003,
-                             ctrl_limit_actuators=["a"], ctrl_limit_margin=0.1, ctrl_limit_rew_scale=0.1))
+    check_robust_plan(Config(ctrl_limit_actuators=["a"], ctrl_limit_margin=0.1, ctrl_limit_rew_scale=0.1))
     for bad in (
-        {"inflate_distance": 0.003},
-        {"inflate_bodies": ["b"]},
         {"ctrl_limit_actuators": ["a"], "ctrl_limit_margin": 0.1},
         {"ctrl_limit_margin": 0.1, "ctrl_limit_rew_scale": 0.1},
     ):
@@ -204,3 +132,76 @@ class RobustPlanTest(unittest.TestCase):
             mjwp.step_env(config, env, torch.full((2, 1), ctrl, device="cuda:0"))
             _, info = mjwp.get_reward(config, env, ref)
             np.testing.assert_allclose(info["ctrl_limit_rew"].cpu().numpy(), -cost, atol=1e-6)
+
+
+# A 4 mm plate on a free body and a capsule fingertip (5 mm radius, 10 mm half length) on a mocap body.
+_STAGE = """
+<mujoco>
+  <worldbody>
+    <body name="stage"><freejoint/><geom name="plate" type="box" size="0.05 0.05 0.002"/></body>
+    <body name="tip" mocap="true"><geom name="tip" type="capsule" size="0.005 0.01"/></body>
+  </worldbody>
+</mujoco>
+"""
+
+
+def test_side_plane_distance_rebuilds_the_ik_side_plane_on_the_moving_body():
+    """side_plane_distance gives MuJoCo's signed distance to the IK side plane, wherever the body goes."""
+    # Covers: the MJWP side reward rebuilding the plane of ik_fast.SidePlanes.reference_planes in the wrong frame
+    # (rotation transposed, plane left in the world while the stage moves) or with the wrong capsule term, so it charges
+    # fingers on the human side of the glass or misses fingers on top of it; and charging a plan where IK itself left
+    # the finger past the plane, so MJWP leaves its reference
+    # Owner: mjwp.side_plane_distance with ik_fast.SidePlanes (CPU, synthetic model)
+    from spider.preprocess.ik_fast import SidePlanes
+    from spider.simulators.mjwp import side_plane_distance
+
+    spec = mujoco.MjSpec.from_string(_STAGE)
+    SidePlanes.add_geoms(spec, 1)
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    tip, plane = model.geom("tip").id, model.geom("side_plane_0").id
+    stage, tip_mocap = model.body("stage").id, model.body("tip").mocapid[0]
+
+    def place(pose, local_pos, local_quat):  # stage pose (x, y, z, qw, qx, qy, qz), tip pose in the stage frame
+        data.qpos[:] = pose
+        mujoco.mj_kinematics(model, data)
+        data.mocap_pos[tip_mocap] = pose[:3] + data.xmat[stage].reshape(3, 3) @ local_pos
+        mujoco.mju_mulQuat(data.mocap_quat[tip_mocap], pose[3:], local_quat)
+        mujoco.mj_kinematics(model, data)
+
+    def distance(planes):
+        arrays = [torch.from_numpy(a.reshape(1, *a.shape)) for a in (data.geom_xpos, data.geom_xmat, data.xpos, data.xmat)]
+        return side_plane_distance(model, [tip], *arrays, planes).item()
+
+    def solved(local_pos, local_quat):  # reference_planes of a frame that IK solved with the tip at this pose
+        place(turned, np.array(local_pos), local_quat)
+        active, body, point, normal = sides.reference_planes(model, data)
+        return torch.tensor([[active[0], body[0], *point[0], *normal[0]]], dtype=torch.float64)
+
+    turned = np.array([0.1, -0.2, 0.3, *(np.array([0.9, 0.2, -0.3, 0.25]) / np.linalg.norm([0.9, 0.2, -0.3, 0.25]))])
+    moved = np.array([0.4, 0.1, 0.05, *(np.array([0.3, 0.8, 0.1, -0.5]) / np.linalg.norm([0.3, 0.8, 0.1, -0.5]))])
+    upright, tilted, flat = [1.0, 0, 0, 0], [0.924, 0.383, 0, 0], [0.707, 0, 0.707, 0]
+    # The human fingertip is 10 mm under the plate near its edge: the plane is on the plate bottom, facing down.
+    place(turned, np.zeros(3), upright)
+    sides = SidePlanes(model, [tip], [model.geom("plate").id])
+    sides.plan(model, data, (turned[:3] + data.xmat[stage].reshape(3, 3) @ [0.04, 0.0, -0.012])[None, None], lambda t: None)
+    sides.place(model, data, 0)
+    planes = solved([0.02, 0.01, -0.03], upright)  # IK left the tip under the plate
+    cases = {  # tip pose in the stage frame; distance to the IK plane geom by MuJoCo's capsule-plane collision
+        "under, upright": ([0.02, 0.01, -0.03], upright),
+        "under, tilted, 2 mm in": ([0.03, 0.0, -0.012], tilted),
+        "on top, flat": ([0.0, 0.0, 0.008], flat),
+    }
+    for name, (local_pos, local_quat) in cases.items():
+        place(turned, np.array(local_pos), local_quat)
+        want = mujoco.mj_geomDistance(model, data, tip, plane, 1.0, np.zeros(6))
+        np.testing.assert_allclose(distance(planes), want, atol=1e-9, err_msg=name)
+        place(moved, np.array(local_pos), local_quat)  # the IK plane geom stays; the side plane moves with the stage
+        np.testing.assert_allclose(distance(planes), want, atol=1e-9, err_msg=f"{name}, stage moved")
+    assert distance(planes) < -0.01  # on top of the plate: past the plane by the plate and the capsule radius
+    # IK left the tip on top, 15 mm past the plane: the plane moves 15 mm up (to z 0.013), and a plan pays only for going
+    # further; under the plate it pays nothing.
+    planes = solved([0.0, 0.0, 0.008], flat)
+    for local_z, want in ((0.008, 0.0), (0.013, -0.005), (-0.03, 0.038)):
+        place(moved, np.array([0.0, 0.0, local_z]), flat)
+        np.testing.assert_allclose(distance(planes), want, atol=1e-9, err_msg=f"relaxed plane, tip at z {local_z}")

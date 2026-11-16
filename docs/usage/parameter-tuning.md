@@ -6,6 +6,18 @@ This guide helps you tune SPIDER parameters for optimal performance on your task
 
 Like reinforcement learning, different motion characteristics require different parameter settings. Start with defaults and iteratively refine based on results.
 
+::: warning Unknown config keys stop the run
+`examples/run_mjwp_fast.py` and `examples/run_mjwp.py` raise a `ValueError`
+when the composed Hydra config holds a key that `spider.config.Config` does
+not have, such as a misspelled key or a removed setting that is left in a
+yaml or added with `+key=value`. Before, such a key was dropped with no
+message. The settings `inflate_bodies` and `inflate_distance` are removed,
+with the mesh inflation of the MJWP model. A `config.yaml` that an earlier
+run saved holds both keys, and a reload of it through `load_config_path`
+does not pass through this check: it stops with a `TypeError` from `Config`.
+Remove the two keys from the file first.
+:::
+
 ## Control Parameters
 
 ### Simulation Timestep (`sim_dt`)

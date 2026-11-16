@@ -148,6 +148,9 @@ uv run spider/preprocess/generate_xml.py \
 - Creates scene with objects from dataset
 - Sets up collision pairs and contact parameters
 - Configures camera and lighting
+- Adds the floor as a plane at the floor height of the task. A `table` entry
+  in `task_info.json`, which built a box floor in an earlier version of this
+  fork, is no longer read and is ignored with no message
 
 **Output:**
 ```
@@ -231,6 +234,91 @@ time: [T]      # Timestamps
 - `--smooth-qvel`: Add velocity smoothness term
 :::
 
+#### Side planes for thin bodies
+
+With `--object-clearance`, `ik_fast.py` keeps the hand collision geoms out of
+the object with a collision limit. The limit does not choose a side: a
+fingertip stays on the side of a thin part, such as a glass plate, that it
+reaches first, also when the human finger is on the other side.
+`--side-plane-bodies` names the bodies for which each robot fingertip must
+stay on the side of the human fingertip:
+
+```bash
+uv run spider/preprocess/ik_fast.py \
+  --task=${TASK} \
+  --dataset-name=${DATASET_NAME} \
+  --data-id=${DATA_ID} \
+  --embodiment-type=${HAND_TYPE} \
+  --robot-type=${ROBOT_TYPE} \
+  --object-clearance 0.0 \
+  --side-plane-bodies right_object
+```
+
+| Item | Behavior |
+| --- | --- |
+| Default | Off: no body is named |
+| Needs | `--object-clearance`. Without it the command stops with a `ValueError` |
+| Plane of a frame | For a fingertip whose human fingertip is outside every collision geom of the named bodies and within `SIDE_PLANE_DISTANCE` (0.04 m) of one: the tangent plane of the nearest geom at its nearest point, facing the human fingertip |
+| Held side | The planes of every frame are found before IK runs (`SidePlanes.plan`). Over each run of frames in which the human fingertip stays near one body, the side with the most frames holds (`hold_sides`). A frame of the other side, or a frame with the fingertip inside the part, takes the plane of the nearest frame of the held side |
+| In IK | One plane geom on a mocap body per fingertip, with a `CollisionAvoidanceLimit` and a `PenetrationTask` between the fingertip geom and its plane |
+| Output | The `side_plane_*` arrays of `trajectory_kinematic.npz` ([data structure](../usage/data-structure.md#trajectory-files-npz)) |
+
+The bodies are named and not chosen by thickness. A cup wall is as thin as a
+plate, and a human fingertip can read inside the hull of a cup that the hand
+holds.
+
+**Frame loop.** The IK loop of the frames after frame 0 follows the presence
+of side planes. It has no flag of its own.
+
+| | Without `--side-plane-bodies` | With `--side-plane-bodies` |
+| --- | --- | --- |
+| IK steps per frame | `max(1, round(ref_dt / sim_dt))` whole steps of `--sim-dt` | Up to `FRAME_STEPS` (40) |
+| Bound on a step | None | Each hinge joint within `MAX_HINGE_STEP` (0.29 deg) and each slide joint within `MAX_SLIDE_STEP` (1 mm), through `mink.VelocityLimit` |
+| Part of a step that is taken | The whole step | The largest of 1, 1/2, ... `MIN_STEP_SCALE` (1/16) of the step that lowers the task cost at the true kinematics (`improving_scale`). The frame ends when no part does |
+| `--sim-dt` sets | The step of every frame, and the timestep of `trajectory_ikrollout.npz` | The step of the two start phases of frame 0, and the timestep of `trajectory_ikrollout.npz` |
+
+The file names, the keys and the shapes of the IK output are the same in both
+loops. The log line of the frame loop names the loop that runs.
+
+The bound comes from the collision limit, which is linear in the step. On one
+two-hand recording with a 4 mm glass plate at 20 ms frames, a wrist that
+turns 5 to 10 deg in one whole step left a fingertip 4.4 to 6.6 mm (95th
+percentile) from where the limit row put it, and a turn of 0.1 to 0.5 deg
+leaves 0.01 to 0.04 mm. Three wrist hinges at 0.29 deg turn the wrist at most
+0.5 deg. Per 20 ms frame the bounds are 11.6 deg and 40 mm, and the fastest
+human wrist of that recording moves 8.5 deg and 27.5 mm per frame. A step
+that stays in a region in which its linear model is valid, and is taken only
+when it lowers the true cost, follows TrajOpt (Schulman et al., RSS 2013,
+[DOI 10.15607/RSS.2013.IX.031](https://doi.org/10.15607/RSS.2013.IX.031)).
+
+Measured on that recording and 16 moved copies of it, against a plane per
+frame with whole steps: the fingertip passes through the plate fall from 109
+to 0, and the frames with a left-hand geom over 1 mm inside the plate fall
+from 50 to 0 of 290.
+
+A task without side planes keeps the whole steps. On a pouring task with no
+side body, the bounded loop changed the 12 finger joints by about 1 deg (mean
+over the carry) with the fingertips within 0.6 mm of their place, and whole
+steps put no hand geom more than 0.4 mm into the cup. Without
+`--side-plane-bodies` the IK output is bit for bit the output of the code
+before the frame loop changed (139 exports of one pouring recording), and
+with it the output is bit for bit that of the bounded loop (161 exports of
+the plate recording).
+
+::: warning Limits of the side planes and the frame loop
+- Naming a side body moves a task to the bounded loop. A frame that ends at
+  the bound, or that takes no step, logs nothing.
+- A frame can end while a part under 1/16 of the step would still lower the
+  cost. On the plate recording, 563 of 1,485 frames take no step.
+- A turn of the plane normal of more than 90 deg between two plane frames
+  counts as a change of side.
+- The constants are sized on one recording at 20 ms frames.
+- `ik_fast_test.py` covers the step bound on a hinge and a slide, the part
+  of a step that `improving_scale` takes, the hold of a side over a near
+  span, and `plan` and `place` on a moving body. No test runs the frame loop
+  of `main()`.
+:::
+
 ### Step 7: Physics-Based Optimization
 
 Optimize trajectory with physics constraints using DIAL-MPC:
@@ -249,6 +337,21 @@ uv run examples/run_mjwp.py \
 - Sets up parallel physics simulation (GPU)
 - Runs sampling-based optimization (DIAL-MPC)
 - Tracks reference while maintaining physics feasibility
+
+**Side reward (`run_mjwp_fast.py`).** When `trajectory_kinematic.npz` holds
+side planes (`ik_fast.py --side-plane-bodies`), `examples/run_mjwp_fast.py`
+adds a side reward: minus `SIDE_REW_SCALE` (1.0) times the summed distance,
+in metres, by which each fingertip collision geom is past its plane. The
+plane moves with its simulated body. IK saves a plane that the IK fingertip
+is already past at the fingertip, so the reward charges a plan only for
+going further past the plane than its IK reference does. `get_reward`
+reports the term as `info["side_rew"]`. There is no config switch: a file
+with no planes gives no term. `Config.side_plane_geom_ids` is a derived
+field that the run sets from the file and saves in its `config.yaml`.
+`examples/run_mjwp.py` does not read the side planes, so a task that is
+solved through it gets no side reward and no message. `mjwp_test.py` checks
+the plane distance on a moving body; no test runs the loading of the planes
+or the reward branch.
 
 **Real-time visualization** shows:
 - Current robot state
